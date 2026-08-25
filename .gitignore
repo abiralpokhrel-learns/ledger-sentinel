@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+.venv/
+venv/
+
+# Secrets / local env
+.env
+
+# Generated runtime data
+ledger_sentinel.db
+*.db
+
+# OS cruft
+.DS_Store
+Thumbs.db

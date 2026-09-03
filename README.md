@@ -139,6 +139,10 @@ Razorpay webhook (raw bytes)
    Dashboard + PDF + /metrics/honest (held-out, FP rupee cost)
 ```
 
+![Ledger Sentinel — Demo](docs/demo.gif)
+
+*Pipeline and dashboard walkthrough — 30s overview of reconciliation, exceptions, and defense panel. Regenerate: `python scripts/generate_demo_gif.py`.*
+
 **Invariants:** No `DELETE FROM` of DB files needed (`clear_all` is Windows-safe). Re-runs are idempotent. Every outcome — `applied`, `duplicate_skipped`, `rejected`, `matched`, `exception` — has an `audit_log` row.
 
 ---
@@ -547,11 +551,12 @@ ledger-sentinel/
 │   └── test_defense.py      # 10 — cost, policy, chargeback, honest metrics
 ├── docs/
 │   ├── dev-log.md           # real 0% match bug, root cause, audit-log proof
+│   ├── demo.gif             # demo walkthrough (see Architecture)
 ├── scripts/
 │   ├── dashboard_smoke_check.py
 │   ├── live_webhook_check.py
 │   ├── generate_architecture.py
-│   └── generate_demo_gif.py
+│   └── generate_demo_gif.py   # builds docs/demo.gif
 ├── .github/workflows/ci.yml # PYTHONPATH=. + pytest + pipeline
 └── ledger_sentinel.db       # WAL, gitignored runtime artifact
 ```
@@ -586,7 +591,8 @@ We disclose simplifications so judges can evaluate credibility:
 ## Docs & Troubleshooting
 
 - `docs/dev-log.md` — real bug (0% match) and how audit_log found it
-- - `scripts/demo_story.py` — 10-order beautiful demo (run `PYTHONPATH=. python scripts/demo_story.py`)
+- `docs/demo.gif` — demo walkthrough — regenerate: `python scripts/generate_demo_gif.py`
+- `scripts/demo_story.py` — 10-order beautiful demo (run `PYTHONPATH=. python scripts/demo_story.py`)
 - `data/generate_synthetic_data.py` — deterministic Faker plan (documented planted inventory)
 
 **`Failed to fetch: https://github.com/.../blob/main/app/webhook.py` or `/tree/main/app`** — those URLs are GitHub **HTML pages**, not raw files. Browsers block `fetch()` on them (CORS/CSP). Use one of these instead:

@@ -1,6 +1,7 @@
 fastapi>=0.110
 uvicorn>=0.27
 pandas>=2.0
+numpy>=1.26
 anthropic>=0.39
 streamlit>=1.36
 python-dotenv>=1.0

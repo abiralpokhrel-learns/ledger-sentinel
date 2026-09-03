@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from app import db, reconcile, webhook
 from app.detection import CostSensitiveDetector, detect_spikes, compute_baseline, rolling_window_features, FN_COST, FP_COST, FP_REVIEW_COST_RUPEES
@@ -332,7 +332,7 @@ def health():
 
 
 @app.get("/stats")
-def stats(request: __import__("fastapi").Request = None):  # type: ignore
+def stats(request: Request = None):
     """Lightweight stats for dashboard / health checks."""
     try:
         # Reuse the lifespan DB handle when available (like /webhook does)
@@ -366,7 +366,7 @@ def stats(request: __import__("fastapi").Request = None):  # type: ignore
 
 
 @app.post("/ask")
-def ask_endpoint(payload: dict, request: __import__("fastapi").Request = None):  # type: ignore
+def ask_endpoint(payload: dict, request: Request = None):
     """AI Finance Assistant — ask questions about the audit log."""
     q = (payload or {}).get("question", "") or (payload or {}).get("q", "")
     try:
@@ -398,7 +398,7 @@ def ask_endpoint(payload: dict, request: __import__("fastapi").Request = None): 
 
 
 @app.get("/export.csv")
-def export_csv(outcome: str | None = None, request: __import__("fastapi").Request = None):  # type: ignore
+def export_csv(outcome: str | None = None, request: Request = None):
     """Download audit_log as CSV. ?outcome=exception for exceptions only."""
     from fastapi.responses import Response
     conn = None
@@ -427,7 +427,7 @@ def export_csv(outcome: str | None = None, request: __import__("fastapi").Reques
 
 
 @app.get("/report.pdf")
-def report_pdf(request: __import__("fastapi").Request = None):  # type: ignore
+def report_pdf(request: Request = None):
     """Download professional PDF audit report."""
     from fastapi.responses import Response
     try:
@@ -468,7 +468,7 @@ def report_pdf(request: __import__("fastapi").Request = None):  # type: ignore
 
 
 @app.post("/reconcile-upload")
-async def reconcile_upload(request: __import__("fastapi").Request):
+async def reconcile_upload(request: Request):
     """Upload orders.csv + settlement.csv and reconcile live. Returns summary + exceptions.
 
     NOTE: This endpoint does amount-only reconciliation (tolerance + TDS band).
@@ -490,8 +490,8 @@ async def reconcile_upload(request: __import__("fastapi").Request):
         if not orders_file or not settlement_file:
             raise HTTPException(status_code=400, detail="Send multipart form with 'orders' and 'settlement' CSV files")
         # Read with size guard
-        orders_bytes = await orders_file.read()  # type: ignore
-        settlement_bytes = await settlement_file.read()  # type: ignore
+        orders_bytes = await orders_file.read()
+        settlement_bytes = await settlement_file.read()
         if len(orders_bytes) > MAX_UPLOAD_BYTES or len(settlement_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail=f"CSV too large (max {MAX_UPLOAD_BYTES//1024//1024} MB per file)")
         if len(orders_bytes) == 0 or len(settlement_bytes) == 0:
@@ -594,12 +594,6 @@ def detect_endpoint(payload: dict):
             det.threshold = 0.5
         result = det.evaluate_stream(df)
         # Persist windows for audit
-        try:
-            # lazy get conn
-            from fastapi import Request
-            pass
-        except Exception:
-            pass
         return {"defense_only": True, "policy": "detection is signal-only; policy engine decides", **result}
     except Exception as e:
         from fastapi import HTTPException
@@ -637,12 +631,6 @@ def policy_decide(payload: dict):
             close_after = False
             import inspect
             # try app.state.db
-            try:
-                from fastapi import Request
-                # we are not in request context with Request, so fallback to db_path
-                pass
-            except Exception:
-                pass
             from app.config import db_path as _dbp
             import app.db as _db
             conn = _db.get_connection(_dbp())

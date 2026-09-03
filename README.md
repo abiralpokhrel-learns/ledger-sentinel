@@ -181,6 +181,8 @@ Upload path on same files: 52 matched / 9 exceptions (85.2%) — delta is 3 plan
 
 > *Move beyond single-transaction probability. Penalize missed fraud 25× more than a false alarm. Aggregate into rolling windows. Flag only spikes.*
 
+> **What this is and isn't:** a **decision layer any fraud model can plug into** — we don't train XGBoost/Isolation Forest here. You bring `scores = model.predict_proba(X)[:,1]`; we bring the money-aware threshold, rolling windows, and spike logic. Evaluated against a synthetic placeholder score in this repo (honest demo) — see Limitations.
+
 Naive models (XGBoost, Isolation Forest) score each transaction in isolation and threshold on accuracy. In finance that is wrong: missing fraud (FN) costs ~25× a false alarm (FP review + friction). Ledger Sentinel wraps *any* scorer with a cost-aware layer:
 
 **Cost function**
@@ -435,7 +437,7 @@ All via environment (see `.env.example`). Dev defaults allow `generate_synthetic
 **Reconciliation constants** (`app/config.py`):
 
 - `TOLERANCE = 0.01` — rounding slack
-- `TDS_RATE = 0.02`, `TDS_BAND = 0.005` — `tds_rate_for(category)` category-aware (still simplified — real TDS varies by threshold/certificate/section)
+- `TDS_RATE = 0.02`, `TDS_BAND = 0.005` — `tds_rate_for(category)` is category-aware in shape but today returns a **flat 2% for every category** (intentionally simplified — real TDS varies by threshold/certificate/section; rehearsed answer for judges)
 - `FN_COST = 25`, `FP_COST = 1`, `FP_REVIEW_COST_RUPEES = 500` — defense cost
 
 ---
@@ -539,7 +541,7 @@ We disclose simplifications so judges can evaluate credibility:
 
 - **Synthetic data.** The 80.3% is on Faker data with planted edges. The upload path (BYO CSV) lets you test on *your* data — "it survived data we didn't design" is the stronger claim.
 - **TDS band.** Flat 2% ±0.5pp, category-aware via `tds_rate_for()` but still flat per category — not real TDS/TCS law (thresholds, certificates, sections). Labeled `exception_tds_candidate` → `expected_tds_withholding` as *candidate*, not certainty.
-- **Matching model.** 1:1 outer join. Real Razorpay settlements are often batched (many orders in one UTR/bank credit). Next is an aggregation layer (group by UTR/date, then match sums).
+- **Matching model.** 1:1 outer join. Real Razorpay settlements are often **batched** (many orders in one UTR/bank credit) — the most likely question from a Razorpay engineer on the panel. Next is an aggregation layer (group by UTR/date, then match sums).
 - **Scale.** SQLite + full-dataframe Pandas is correct for demo (60 → 10k rows fine). For production: Postgres + incremental reconciliation + `classify_exceptions_batch` with hash cache + ThreadPool (already ships; `LEDGER_NO_CACHE=1` to force fresh).
 - **Scoring model.** `app/detection.py` and `app/metrics.py` use synthetic scores to demo cost-sensitive thresholding and windowing. Plugging a real XGBoost/IsolationForest scorer is a one-line `scores = model.predict_proba(X)[:,1]` before `find_optimal_threshold` — the cost, window, and spike logic is model-agnostic.
 

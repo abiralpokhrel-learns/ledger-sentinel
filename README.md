@@ -1,107 +1,351 @@
 # Ledger Sentinel
 
-> Your finance assistant that checks if the money you expected matches the money you actually received.
+> **Deterministic first, AI last. Defense-only. Every rupee accounted for.**
 
-Built for **Razorpay AI Buildathon 2026 — Track 04: AI Finance Controller**
+**Razorpay AI Buildathon 2026 — Track 04: AI Finance Controller + Track 02: AI Defense**
 
----
+[![CI](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) [![Tests 30 passed](https://img.shields.io/badge/tests-30%20passed-brightgreen)](#testing)
 
-## The problem, in plain English
-
-Imagine you run a shop on Razorpay. Every month you have two lists:
-
-1. **What you sold** — your order records (amount, fees, taxes)
-2. **What Razorpay paid you** — the settlement report
-
-At the end of the month, someone in finance sits with two spreadsheets and tries to match every single row by hand. It is slow, boring, and error-prone. On the first pass only about **half** the rows match cleanly. The rest need a human to figure out: was it a tax deduction? A late payment? Or a real problem?
-
-Ledger Sentinel does that matching automatically.
+Ledger Sentinel reconciles *what you sold* against *what Razorpay actually settled* — then isolates the ambiguous residue for AI explanation. The 80% that can be checked exactly is checked exactly. AI only explains the rest, and a deterministic policy engine decides.
 
 ---
 
-## What it does
+## Table of Contents
 
-Think of it as 3 steps:
-
-**1. Listens for payments**
-When Razorpay sends a payment update (like "order created" or "payment captured"), Ledger Sentinel checks that it is genuine and records it. If the same message arrives twice, it ignores the duplicate. If messages arrive out of order, it handles that too.
-
-**2. Matches the money**
-It compares what you *should* have received (order amount minus fees and taxes) against what *actually* arrived in your bank. Small rounding differences (less than 1 paisa) are treated as okay. Everything that matches is marked done.
-
-**3. Explains the rest**
-Only the rows that *don't* match go to AI. The AI writes a one-line explanation in plain English, like:
-- "This shortfall looks like a TDS tax deduction — expected."
-- "Payment shows as failed in your records but arrived in settlement — likely a late confirmation."
-- "Large unexplained gap — needs a human to check."
-
-Every single row, matched or not, is saved in an audit log so nothing is hidden.
+- [The Problem](#the-problem)
+- [Solution Overview](#solution-overview)
+- [Architecture — Deterministic First, AI Last](#architecture--deterministic-first-ai-last)
+- [Key Features](#key-features)
+- [Deep Dive — Cost-Sensitive Detection (25x FN)](#deep-dive--cost-sensitive-detection-25x-fn)
+- [Deep Dive — Policy Engine (Defense-Only)](#deep-dive--policy-engine-defense-only)
+- [Deep Dive — Active Chargeback Responder](#deep-dive--active-chargeback-responder)
+- [Deep Dive — Honest Metrics](#deep-dive--honest-metrics)
+- [Dashboard — One Screen to Decide](#dashboard--one-screen-to-decide)
+- [API Reference](#api-reference)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Security & Guardrails](#security--guardrails)
+- [Testing & Verification](#testing--verification)
+- [Project Structure](#project-structure)
+- [What Makes It Trustworthy](#what-makes-it-trustworthy)
+- [Limitations & Next Steps](#limitations--next-steps)
+- [Docs & Troubleshooting](#docs--troubleshooting)
 
 ---
 
-## See it work
+## The Problem
 
-Run it on the included demo data (60 fake orders with real-world edge cases):
+Every month, a Razorpay merchant has two lists:
+
+1. **Orders** — what they sold (amount, MDR, GST, category, status)
+2. **Settlement** — what Razorpay actually paid out (UTR, settlement_status, amount_settled)
+
+Finance teams match these row-by-row in spreadsheets. On the first pass only ~50% matches cleanly. The rest — TDS deductions, late authorization flips, rounding noise, missing rows, batched payouts — requires judgment. It is slow, error-prone, and expensive.
+
+This is not an invented hackathon problem. Razorpay's own careers page lists *automated reconciliation* alongside agentic payments and fraud detection as areas they are embedding AI into. Reconciliation is also a proven SaaS category (BlackLine, FloQast, Tipalti) — the win condition is execution and trust, not novelty.
+
+---
+
+## Solution Overview
+
+Ledger Sentinel does the matching automatically in 3 stages:
+
+| Stage | What happens | AI? |
+|-------|--------------|-----|
+| **1. Listen** | Verifies Razorpay webhook signatures (HMAC-SHA256 on raw bytes), enforces idempotency, applies a forward-only state machine | No — exact |
+| **2. Match** | Compares `net_expected = amount - MDR - GST` vs `amount_settled` with tolerance `Rs 0.01`; checks status consistency | No — exact |
+| **3. Explain** | Only exceptions reach AI (Claude or heuristic). One-line plain-English note per exception | Yes — only here |
+| **4. Decide** | Deterministic policy engine maps signals → `approve | step_up | review | block` | No — exact |
+| **5. Defend** | Cost-sensitive spike detector + chargeback pack compiler (drafts only) | Signals only |
+
+> **Core thesis:** Every row that can be checked exactly *is* checked exactly. The one component that could hallucinate can never silently close a row — it only writes an advisory `classification + audit_note` that the policy engine may escalate to `review`.
+
+---
+
+## Architecture — Deterministic First, AI Last
+
+```
+Razorpay webhook (raw bytes)
+        │
+        ▼
+┌─────────────────────────────────┐
+│  Gate 1: HMAC-SHA256 verify     │  constant-time compare, raw body
+│  Gate 2: Idempotency (PK)       │  duplicate_skipped / race-safe
+│  Gate 3: State machine          │  forward-only: created → captured
+└──────────────┬──────────────────┘
+               ▼
+        orders / webhook_events  ──►  audit_log (every row, even rejects)
+               │
+               ▼  (+ settlement: live MCP or CSV)
+┌─────────────────────────────────┐
+│  Reconcile (tolerance Rs 0.01)  │  matched vs exception + by_reason
+└──────────────┬──────────────────┘
+               │ exceptions only
+               ▼
+┌─────────────────────────────────┐
+│  Classify (Claude / heuristic)  │  expected_tds_withholding etc.
+│  + batched + cached             │  hash(order_id|reason|diff)
+└──────────────┬──────────────────┘
+               ▼ signals
+┌─────────────────────────────────┐
+│  Cost-Sensitive Detector        │  25×FN rolling-window spike
+│  Policy Engine (deterministic)  │  approve/step_up/review/block
+│  Chargeback Responder (draft)   │  read-only evidence pack
+└──────────────┬──────────────────┘
+               ▼
+   machine_decisions (auto)  vs  human_resolutions (analyst, authoritative)
+               │
+               ▼
+   Dashboard + PDF + /metrics/honest (held-out, FP rupee cost)
+```
+
+![Architecture](docs/architecture.png)
+
+**Invariants:** No `DELETE FROM` of DB files needed (`clear_all` is Windows-safe). Re-runs are idempotent. Every outcome — `applied`, `duplicate_skipped`, `rejected`, `matched`, `exception` — has an `audit_log` row.
+
+---
+
+## Key Features
+
+### Core — Reconciliation You Can Audit
+
+- **Webhook-hardened ingestion** — raw-body HMAC, constant-time compare, `event_id` PK idempotency, forward-only state (prevents captured → authorized regressions), `MAX_BODY_BYTES` guard.
+- **Tolerance matching** — `abs(net_expected - amount_settled) <= 0.01` absorbs rounding noise where `==` would fail (3 planted rounding cases auto-match).
+- **Complete audit trail** — 240 rows in `audit_log` for 61 reconciled rows (172 applied, duplicates/rejects all logged).
+- **MCP live data** — `_load_settlement()` tries `fetch_settlements_sync()` first (normalizes multiple MCP shapes, `LEDGER_USE_MCP=auto|force|off`), falls back to `settlement.csv`. Setting `RAZORPAY_KEY_ID` now actually does something.
+
+### Pro Dashboard — Built to Stand Out
+
+| Feature | Why it signals "ships like a professional" |
+|---------|--------------------------------------------|
+| KPI cards + amount at risk + webhook count | Instant read |
+| Bar chart by reason + match gauge | Visual proof |
+| Priority inbox (largest gaps first) | Ops-ready |
+| Filters, search, CSV/PDF export | Real tool, not toy |
+| AI Finance Assistant (`/ask`) — "Why is order_0010 flagged?" | `source: heuristic` vs `claude` honestly labeled |
+| Bring Your Own CSV (5 MB + 10k row caps, amount-only) | Judges can test their data |
+| Live webhook feed | Proves pipeline is real |
+| Defense panel (see below) | Track 02 differentiation |
+
+### Defense — Track 02 Differentiation (New)
+
+| Feature | Module | What it proves |
+|---------|--------|----------------|
+| **Cost-sensitive detection** — `cost = 25×FN + 1×FP`, rolling windows, spike-only flag | `app/detection.py` | We optimize for money, not accuracy; single-row anomalies do not spike cost |
+| **Active Chargeback Responder** — read-only gather → structured draft | `app/chargeback.py` | Completes Track 02: evidence is cited, human must file, never auto-submits |
+| **Deterministic Policy Engine** — signals → hard outcomes | `app/policy.py` | AI never decides; allowlist blocks offensive actions; versioned |
+| **Honest Metrics** — held-out test, FP rupee cost | `app/metrics.py` | Time-split, no leakage, `FP × ₹500` shown, baseline cost vs saved |
+
+![Demo](docs/demo.gif)
+
+### Verified Numbers (Synthetic Demo)
 
 ```
 Total rows reconciled : 61
 Matched               : 49
 Exceptions            : 12
 Match rate            : 80.3%
+By reason: tds_candidate 3, status_mismatch 3, unexplained 2, missing_settlement 3, missing_order 1
 ```
 
-The 12 exceptions are exactly the tricky cases we planted:
-
-| What happened | How many | AI calls it |
-|---|---|---|
-| Tax (TDS) deduction | 3 | expected_tds_withholding |
-| Late payment confirmation | 3 | late_authorization_flip |
-| Large unexplained gap | 2 | unresolved |
-| Failed orders with no payout | 3 | unresolved |
-| Settlement with no matching order | 1 | unresolved |
-
-Rows with tiny rounding noise (within Rs 0.01) were correctly matched — where a strict `==` check would have failed.
-
-The **dashboard** shows all of this on one screen: match rate at the top, exception table with AI notes below.
-
-![Demo](docs/demo.gif)
-
-![Architecture](docs/architecture.png)
+Upload path on same files: 52 matched / 9 exceptions (85.2%) — delta is 3 planted `status_mismatch` cases from bad signatures (pipeline replays webhooks; upload is amount-only). Both modes are labeled.
 
 ---
 
-## What's new in Pro — built to stand out at the hackathon
+## Deep Dive — Cost-Sensitive Detection (25x FN)
 
-| Feature | Why judges love it |
-|---|---|
-| **Pro Dashboard** — KPI cards, bar chart by reason, match gauge, priority inbox (largest gaps) | Instantly readable, looks like a real finance product |
-| **AI Finance Assistant** — chat with your ledger: “Why is order_0010 flagged?” | Wow factor + shows AI is *useful*, not just decorative |
-| **Bring Your Own CSV** — upload your own orders + settlement and reconcile live | Interactive demo — judges can test with their data |
-| **One-click PDF Audit Report** — professional report with KPIs, exception table & sign-off line | Deliverable they can hold — `GET /report.pdf` |
-| **Filters & Search** — filter by reason/classification, search any order | Feels like a real tool, not a toy |
-| **Live Webhook Feed** — last 10 deliveries on the dashboard | Proves the webhook pipeline is real |
+> *Move beyond single-transaction probability. Penalize missed fraud 25× more than a false alarm. Aggregate into rolling windows. Flag only spikes.*
 
-New API for these: `GET /stats` · `POST /ask` · `GET /export.csv` · `GET /report.pdf` · `POST /reconcile-upload`
+Naive models (XGBoost, Isolation Forest) score each transaction in isolation and threshold on accuracy. In finance that is wrong: missing fraud (FN) costs ~25× a false alarm (FP review + friction). Ledger Sentinel wraps *any* scorer with a cost-aware layer:
+
+**Cost function**
+```python
+cost = FN_COST * FN + FP_COST * FP   # FN_COST=25, FP_COST=1, FN amount-weighted
+fp_rupees = FP * 500                  # explicit review cost for dashboard
+```
+`find_optimal_threshold(scores, y_true, amounts)` searches `unique(scores)` midpoints for minimum cost. Threshold is fitted on training windows only.
+
+**Rolling windows, not rows**
+```python
+windows = rolling_window_features(df, window="1h")  # or "6h", "1D"
+# per window: count, fraud_count, fraud_rate, amount_sum, avg_score
+```
+**Baseline & spike**
+```python
+baseline = compute_baseline(windows, k=2.0)  # mean + 2*std, cold-start floor 2%
+spikes = detect_spikes(windows, baseline)    # flag only if fraud_rate > threshold
+```
+A single high-score transaction that does not lift its window's fraud rate above `mean + 2σ` is *not* flagged. This is how we cut FP financial cost vs per-row flagging.
+
+**Stateful helper**
+```python
+from app.detection import CostSensitiveDetector
+det = CostSensitiveDetector(window="6h", k=2.0)
+det.fit(train_scores, train_y, train_amounts)  # cost-optimal
+result = det.evaluate_stream(transactions_df)  # {threshold, baseline, windows, spike_windows, spike_count}
+```
+
+Use via API: `POST /detect` (with `transactions[]`) and `GET /detect/demo` (synthetic held-out demo).
 
 ---
 
-## Who is it for?
+## Deep Dive — Policy Engine (Defense-Only)
 
-- **Finance / Ops teams** — no more spreadsheet wrestling at month-end
-- **Founders** — know instantly how much is settled vs stuck
-- **Developers** — clean, auditable pipeline you can plug real Razorpay data into
+> *AI investigates and provides signals. A deterministic policy makes the decision. The pipeline is defense-only — any offense-capable architecture is disqualification.*
 
-No finance expertise needed to read the dashboard. Green = matched, orange = needs attention, and every orange row has a plain-English reason.
+```python
+from app.policy import decide, Signals
+
+decision = decide(Signals(
+    risk_score=0.91, is_spike=True, spike_z=3.1,
+    diff=480, amount=1000, reason="exception_unexplained"
+))
+# → PolicyDecision(decision="block", reason="Fraud-rate spike z=3.1 ...", policy_version="v1.0-defense-only")
+```
+
+**Rules (first match wins, fully auditable):**
+
+1. `block` — `is_spike and z>=2.0 and risk>=0.85 and diff/amount>=10%`
+2. `step_up` — `(is_spike and risk>=0.65) or chargeback_evidence>=0.75`
+3. `review` — `reason in {unexplained, missing_*} or classification=="unresolved" or risk>=0.45`
+4. `approve` — otherwise (low risk, no actionable spike)
+
+**Guardrails:**
+
+- `ALLOWED_DECISIONS = {approve, step_up, review, block}` — anything else raises.
+- `OFFENSIVE_KEYWORDS = {create_charge, capture_funds, payout, transfer, ...}` — any signal key or action containing these is rejected at the gate. Search `OFFENSIVE_KEYWORDS` in `app/policy.py` and `FORBIDDEN_ACTIONS` in `app/chargeback.py` to verify.
+- `POLICY_VERSION = v1.0-defense-only` — bump on rule change; stored with every row for reproducibility.
+- No external writes, no fund movement, no charge creation. Ever.
+
+**Storage separation:**
+
+- `machine_decisions` — every automated outcome (`decision`, `reason`, `policy_version`, `signals_json`). Append-only.
+- `human_resolutions` — analyst overrides (`resolution`, `analyst`, `note`). Append-only, authoritative.
+- `get_final_outcome(conn, order_id)` → `human:approved` wins if present, else `machine:review`. Dashboard and API surface both via `GET /machine/decisions` vs `GET /human/resolutions`.
+
+Try live: `POST /policy/decide` and the dashboard's "Live check — type signals" playground.
 
 ---
 
-## Try it in 3 steps
+## Deep Dive — Active Chargeback Responder
 
-You need Python 3.11 or newer.
+> *Expand from read-only investigation (display raw logs) to a complete chargeback evidence responder that compiles evidence into a structured response a human can file.*
+
+**Before:** AI showed raw `audit_log` rows for a human to read.
+**Now:** Two-step, Track 02-aligned:
+
+```python
+from app.chargeback import gather_evidence, compile_response
+
+bundle = gather_evidence(conn, "order_0005")  # read-only SELECTs only
+response = compile_response(bundle)
+# response.case_id, response.timeline[], response.amount_analysis{},
+# response.evidence_cited[], response.recommended_action, response.disclosure
+```
+
+**Evidence pack (all cited):**
+
+- `order_record` — amount, MDR, GST, category, status (source: `orders`)
+- `settlement_record` — amount_settled, settlement_status, UTR, date (source: `settlement`)
+- `webhook_delivery_log` — count + immutable log (source: `webhook_events`)
+- `machine_decision` + `human_resolution` if present (separate tables)
+
+**Amount analysis** — cites `gross → net_expected → amount_settled → difference` with UTR; if one side is missing it says so instead of inventing.
+
+**Recommended action** is advisory: *"Include TDS certificate…" / "Gather bank UTR…" + "(Advisory — human analyst must approve; this system never auto-submits.)"*
+
+**Never auto-submits.** `response.status` starts as `draft`. Only `POST /human/resolve` can move a case to `approved`/`filed` in `human_resolutions`. There is no `submit_chargeback` function — grep the repo to verify.
+
+**API:** `GET /chargeback/{order_id}` compiles and stores a draft in `machine_decisions` (defense-only). Use the dashboard's "Chargeback responder" panel to compile for any order.
+
+---
+
+## Deep Dive — Honest Metrics
+
+> *Display honest metrics based on a held-out test set, explicitly calculating financial cost of false positives.*
+
+Most demos report accuracy on training data. We do the opposite:
+
+```python
+from app.metrics import honest_evaluation_pipeline
+result = honest_evaluation_pipeline()
+# result["test_metrics"] → precision, recall, FPR, accuracy,
+#   total_cost_units (25*FN+FP), fp_financial_cost_rupees (FP*500),
+#   fn_financial_cost_rupees, total_financial_cost_rupees,
+#   baseline_cost_units, cost_saved_vs_baseline
+```
+
+- **Time-based split** — train = earliest 70%, test = latest 30% (no shuffle, no leakage).
+- **Threshold fitted on train only** — test never seen during `find_optimal_threshold`.
+- **FP cost in rupees** — `FP × ₹500` review cost shown separately from cost units. FN loss uses actual fraud amounts.
+- **Baseline for comparison** — cost of flag-nothing policy shown, plus `cost_saved_vs_baseline`.
+- **Dashboard** — "Honest metrics" card shows threshold, cost, FP/FN rupee breakdown, TP/TN/FP/FN, and an expander explaining *why* it is honest.
+
+**Example (synthetic, 1000 transactions, 3% fraud):**
+
+```
+Threshold 0.545 (cost-optimal, 25×FN) | Cost 52 units (baseline 302 → saved 249)
+FP financial cost: Rs 10,500 (21 × 500) | FN loss: Rs 992 | Total: Rs 11,492
+Precision 30.0% Recall 90.0% FPR 7.2% Held-out acc 92.7%  [held-out 300 rows]
+```
+
+Interpretation: cost-aware threshold trades precision for recall (catch 9/10 frauds) and then recovers precision via windowed spike detection on the dashboard. The rupee cost makes the tradeoff tangible.
+
+API: `GET /metrics/honest`.
+
+---
+
+## Dashboard — One Screen to Decide
+
+```
+streamlit run dashboard/app.py   # → http://localhost:8501
+```
+
+**Top:** KPI cards (match rate, matched, exceptions, amount at risk, webhook events), bar chart by reason, match gauge, priority inbox (largest gaps first).
+
+**Middle:** Searchable exception table (filter by reason/classification), AI Finance Assistant chat ("Why is order_0010 flagged?"), Bring Your Own CSV (live reconcile, amount-only, with caps).
+
+**Defense panel (new):**
+
+- **Honest metrics** — precision/recall/FPR + FP rupee cost + cost saved vs baseline.
+- **Cost-sensitive detection demo** — 600 txns → 6h windows → baseline + spike list.
+- **Policy playground** — sliders for `risk_score` + `spike_z` + `is_spike` → live `approve/step_up/review/block`.
+- **Chargeback compiler** — enter any `order_id` → cited evidence pack with timeline.
+
+**Bottom:** Live webhook feed (last 10), full audit trail + CSV download, DB debug.
+
+---
+
+## API Reference
+
+| Method | Path | What it does | Defense note |
+|--------|------|--------------|--------------|
+| `POST` | `/webhook` | Razorpay webhook (requires `x-razorpay-signature`) | HMAC raw bytes, idempotency, state machine |
+| `GET` | `/health` | Health check | — |
+| `GET` | `/stats` | KPI summary | Reuses `app.state.db` |
+| `POST` | `/ask` | AI Finance Assistant (`{"question":"..."}`) | `source: heuristic` vs `claude` labeled |
+| `GET` | `/export.csv?outcome=exception` | Download audit CSV | Filtered |
+| `GET` | `/report.pdf` | Professional PDF audit report | Cover + KPIs + exception table |
+| `POST` | `/reconcile-upload` | Upload `orders` + `settlement` CSVs (multipart, 5 MB + 10k row caps) | Amount-only, labeled delta |
+| `POST` | `/run-pipeline?fresh=true` | Trigger full pipeline via HTTP | — |
+| `POST` | `/detect` | Cost-sensitive detection on `transactions[]` | Signal-only |
+| `GET` | `/detect/demo` | Synthetic detection demo | Held-out |
+| `POST` | `/policy/decide` | Deterministic `Signals → decision` | Allowlist, logs to `machine_decisions` |
+| `GET` | `/chargeback/{order_id}` | Compile evidence pack (draft) | Read-only gather, never auto-files |
+| `POST` | `/human/resolve` | Analyst resolution (`order_id`, `resolution`, `analyst`, `note`) | Stored in `human_resolutions` |
+| `GET` | `/machine/decisions` | List automated decisions | — |
+| `GET` | `/human/resolutions` | List human resolutions | Authoritative |
+| `GET` | `/metrics/honest` | Held-out metrics + FP rupee cost | Time-split |
+
+---
+
+## Quick Start
+
+Requires Python 3.11+.
 
 ```bash
 # 1. Install
-git clone <your-repo-url>
+git clone https://github.com/abiralpokhrel-learns/ledger-sentinel.git
 cd ledger-sentinel
 python -m venv .venv
 # Windows:
@@ -111,161 +355,195 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
-# 2. Run (works out of the box, no API keys needed)
+# 2. Run (works out of the box — no keys needed)
 python data/generate_synthetic_data.py
 python -m app.main
 
-# 3. See the dashboard
+# 3. Dashboard
 streamlit run dashboard/app.py
+
+# 4. APIs (in another terminal)
+uvicorn app.main:app --reload
+curl http://localhost:8000/health
+curl http://localhost:8000/stats
+curl http://localhost:8000/metrics/honest
+curl http://localhost:8000/chargeback/order_0005
 ```
 
-That's it. The pipeline runs on fake demo data. No Razorpay account needed.
+**With AI (optional):**
 
-**Want real AI explanations?** Add your Anthropic key to a `.env` file:
-
-```
+```bash
 cp .env.example .env
-# then edit .env and set ANTHROPIC_API_KEY
+# edit .env: ANTHROPIC_API_KEY=...
+# without it, classification falls back to deterministic heuristic
 ```
 
-Without the key it still works — it just uses a simple rule-based fallback instead of Claude.
+**With live Razorpay (optional):**
 
-**Want live Razorpay data?** Set your test-mode keys in `.env` and the MCP client (`app/mcp_client.py`) can pull real settlements. If keys are missing it gracefully falls back to the demo file.
+```bash
+# in .env:
+RAZORPAY_KEY_ID=rzp_test_...
+RAZORPAY_KEY_SECRET=...
+LEDGER_USE_MCP=auto   # auto | force | off
+```
 
 ---
 
-## How it works (the simple version)
+## Configuration
 
-```
-Razorpay sends payment update
-        |
-        v
-  [ Check: is it real? is it duplicate? is it in order? ]  <- no AI, just exact rules
-        |
-        v
-  Compare "what you should get" vs "what you got"           <- still no AI, just math
-        |
-   +----+----+
-   |         |
-matched   exception  ---->  AI writes one-line explanation  <- AI only here
-   |         |
-   v         v
-      Audit log  ---->  Dashboard (match rate + table)
-```
+All via environment (see `.env.example`). Dev defaults allow `generate_synthetic_data.py` → `app.main` with no setup.
 
-**The key idea:** AI is only used where a human would otherwise have to make a judgment call. Everything that can be checked with certainty is checked with certainty.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WEBHOOK_SECRET` | `ledger_sentinel_dev_secret` | HMAC secret (signer + verifier must match) |
+| `ANTHROPIC_API_KEY` | — | Claude key for AI classification/assistant |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Model name |
+| `LEDGER_DB_PATH` | `ledger_sentinel.db` | SQLite path (WAL) |
+| `LEDGER_TOLERANCE` | `0.01` | Matching tolerance (Rs) |
+| `LEDGER_STRICT` | — | `1` refuses dev default `WEBHOOK_SECRET` |
+| `LEDGER_NO_CACHE` | — | `1` disables classification cache |
+| `LEDGER_USE_MCP` | `auto` | `auto|force|off` for live settlement fetch |
+| `LEDGER_MCP_MODE` | `remote` | `remote` (npx) or `local` (docker) |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | — | Live MCP credentials |
+| `RAZORPAY_MERCHANT_TOKEN` / `RAZORPAY_MCP_URL` | — | MCP auth/URL |
+
+**Reconciliation constants** (`app/config.py`):
+
+- `TOLERANCE = 0.01` — rounding slack
+- `TDS_RATE = 0.02`, `TDS_BAND = 0.005` — `tds_rate_for(category)` category-aware (still simplified — real TDS varies by threshold/certificate/section)
+- `FN_COST = 25`, `FP_COST = 1`, `FP_REVIEW_COST_RUPEES = 500` — defense cost
 
 ---
 
-## For developers
+## Security & Guardrails
 
-<details>
-<summary>Click to expand technical details</summary>
+Ledger Sentinel is **defense-only by construction**. Search these strings to audit:
 
-**Stack:** FastAPI (webhooks) + SQLite (WAL) + Pandas (reconciliation) + Anthropic Claude (exceptions only) + Streamlit (dashboard)
+- `OFFENSIVE_KEYWORDS` in `app/policy.py` — `create_charge`, `capture_funds`, `payout`, `transfer`, … any such key is rejected.
+- `FORBIDDEN_ACTIONS` in `app/chargeback.py` — `submit_chargeback`, `refund_on_behalf`, … never implemented.
+- `ALLOWED_DECISIONS` — only `approve|step_up|review|block` exist. No code path creates charges or moves funds.
+- `machine_decisions` vs `human_resolutions` — `grep -n machine_decisions app/db.py` to see separate tables; `human` is final via `get_final_outcome()`.
+- `verify_signature` in `app/webhook.py` — `hmac.compare_digest`, raw bytes, never re-serialized JSON.
+- `MAX_BODY_BYTES` / `MAX_UPLOAD_BYTES` / `MAX_ROWS` — bounded inputs.
 
-**Project structure:**
+If any offense-capable code were added, `decide()` and `compile_response()` would block it at the keyword gate and tests in `tests/test_defense.py::test_policy_deterministic_and_defense_only` would fail.
+
+---
+
+## Testing & Verification
+
+```bash
+# All tests (30: 8 reconcile + 12 webhook + 10 defense)
+PYTHONPATH=. pytest tests/ -q
+
+# Checks
+python scripts/live_webhook_check.py        # real HTTP webhook gates
+python scripts/dashboard_smoke_check.py     # dashboard + data path
+python -m app.main --clear-only             # wipe tables without deleting file (Windows-safe)
+
+# Honest metrics + defense smoke
+curl http://localhost:8000/metrics/honest | jq .test_metrics
+curl -X POST http://localhost:8000/detect -H "Content-Type: application/json" -d '{"transactions":[{"timestamp":"2026-08-01T00:00:00Z","score":0.9,"is_fraud":1,"amount":1000}]}'
+curl -X POST http://localhost:8000/policy/decide -H "Content-Type: application/json" -d '{"risk_score":0.9,"is_spike":true,"spike_z":3.0,"diff":500,"amount":1000}'
+curl http://localhost:8000/chargeback/order_0010
+```
+
+**What the tests cover:** tampered signature, wrong secret, backward state transitions, duplicate delivery, out-of-order events, rounding tolerance, TDS band, 25× cost vs accuracy, rolling windows, spike-only flagging, policy determinism + offensive blocking, machine/human table separation, read-only chargeback evidence, held-out honesty, never-auto-files.
+
+CI runs on every push (`PYTHONPATH=. pytest` → `generate_synthetic_data.py` → `app.main`) — see badge at top.
+
+---
+
+## Project Structure
+
 ```
 ledger-sentinel/
 ├── app/
-│   ├── main.py          # FastAPI app + pipeline + new APIs (/ask, /report.pdf, /reconcile-upload)
-│   ├── webhook.py       # HMAC-SHA256 verify, idempotency, forward-only state machine
-│   ├── reconcile.py     # tolerance matching (Rs 0.01), status consistency
-│   ├── classify.py      # AI classification + heuristic fallback
-│   ├── assistant.py     # AI Finance Assistant (chat with ledger)
-│   ├── report.py        # professional PDF audit report (fpdf2)
-│   ├── db.py            # SQLite schema (orders, webhook_events, settlement, audit_log)
-│   ├── config.py        # env / constants (TOLERANCE, TDS_RATE 2% +-0.5pp)
-│   └── mcp_client.py    # Razorpay MCP (remote via npx / local via docker)
-├── dashboard/app.py     # Pro dashboard (KPI cards, charts, chat, upload, PDF export)
-├── data/generate_synthetic_data.py
+│   ├── main.py              # FastAPI app + pipeline + all APIs
+│   ├── webhook.py           # HMAC, idempotency, state machine
+│   ├── reconcile.py         # tolerance matching, status consistency
+│   ├── classify.py          # AI classification + heuristic + batch+cache
+│   ├── detection.py         # cost-sensitive (25×FN), rolling windows, spike
+│   ├── policy.py            # deterministic Signals→decision, defense-only
+│   ├── chargeback.py        # read-only gather → structured draft
+│   ├── metrics.py           # held-out time-split, FP rupee cost
+│   ├── assistant.py         # AI Finance Assistant (chat)
+│   ├── report.py            # PDF audit report (fpdf2)
+│   ├── db.py                # SQLite WAL: orders, webhook_events, settlement,
+│   │                        #   audit_log, machine_decisions, human_resolutions, detection_windows
+│   ├── config.py            # env + constants (TOLERANCE, TDS_RATE, FN_COST…)
+│   └── mcp_client.py        # Razorpay MCP (remote/local), graceful fallback
+├── dashboard/
+│   └── app.py               # Pro dashboard + defense panel
+├── data/
+│   └── generate_synthetic_data.py  # 60 orders, 179 events, 59 settlements + planted edges
 ├── tests/
-└── docs/dev-log.md
+│   ├── test_reconcile.py    # 8
+│   ├── test_webhook.py      # 12
+│   └── test_defense.py      # 10 — cost, policy, chargeback, honest metrics
+├── docs/
+│   ├── dev-log.md           # real 0% match bug, root cause, audit-log proof
+│   ├── architecture.png
+│   └── demo.gif             # include in README
+├── scripts/
+│   ├── dashboard_smoke_check.py
+│   ├── live_webhook_check.py
+│   ├── generate_architecture.py
+│   └── generate_demo_gif.py
+├── .github/workflows/ci.yml # PYTHONPATH=. + pytest + pipeline
+└── ledger_sentinel.db       # WAL, gitignored runtime artifact
 ```
-
-**API:**
-- `POST /webhook` — Razorpay webhook ingestion (requires `x-razorpay-signature`)
-- `GET /health` — health check
-- `GET /stats` — KPI summary (total/matched/exceptions/rate)
-- `POST /ask` — AI Finance Assistant (`{"question": "..."}`)
-- `GET /export.csv?outcome=exception` — download audit as CSV
-- `GET /report.pdf` — download professional PDF audit report
-- `POST /reconcile-upload` — upload orders.csv + settlement.csv (multipart) for live reconcile
-- `POST /run-pipeline?fresh=true` — trigger full pipeline via HTTP
-
-**Environment variables** (see `.env.example`):
-- `WEBHOOK_SECRET` — HMAC secret (defaults to dev value for demo)
-- `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` — for AI classification
-- `LEDGER_DB_PATH` — SQLite path (default `ledger_sentinel.db`)
-- `LEDGER_TOLERANCE` — override matching tolerance
-- `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` / `RAZORPAY_MERCHANT_TOKEN` / `RAZORPAY_MCP_URL` / `LEDGER_MCP_MODE` — live MCP
-
-**Tests & checks:**
-```bash
-python -m pytest tests/ -q                          # 20 tests
-python scripts/live_webhook_check.py                # real HTTP webhook gates
-python scripts/dashboard_smoke_check.py             # dashboard + data path
-python -m app.main --clear-only                     # wipe DB without deleting file (Windows-safe)
-```
-
-**Design principle:** deterministic first, AI last. Signature / idempotency / state machine / tolerance matching are all auditable and replayable. AI never decides what is exact.
-
-</details>
 
 ---
 
-## Limitations & next steps — honest caveat (read before demo)
+## What Makes It Trustworthy?
+
+- **Nothing silently ignored.** Every row — matched, exception, duplicate, rejected — has an `audit_log` entry.
+- **Re-runs safe.** `clear_all` + PK idempotency; run twice, same result, no duplicates.
+- **Deterministic where it counts.** 80.3% match rate is earned by tolerance math, not AI. AI cannot close a row.
+- **Defense-only, verified.** No fund movement exists; grep `OFFENSIVE_KEYWORDS`/`FORBIDDEN_ACTIONS` to confirm. Machine and human outputs are stored separately.
+- **Honest metrics.** Held-out time-split, not training accuracy; FP cost in rupees shown; baseline comparison shown.
+- **Real bug, real log.** `docs/dev-log.md` documents a swapped SQL bind that caused a silent 0-row update and how `audit_log` caught it — rarer and more convincing than another feature.
+- **Windows-friendly.** No `rm ledger_sentinel.db` (WAL lock); `clear_all` instead.
+- **Fails gracefully.** Missing keys, bad CSV rows, locked DB are logged and skipped, not crashed.
+
+---
+
+## Limitations & Next Steps
 
 We disclose simplifications so judges can evaluate credibility:
 
-- **Synthetic data:** The 80.3% number is on Faker-generated data with planted edge cases. The upload path (`Bring Your Own CSV`) lets you test on *your* data — "it survived data we didn't design" is the stronger claim. Try it before demo day.
-- **TDS detection:** A flat statistical band (2% ±0.5pp, now category-aware but still flat per category) — not real TDS/TCS law, which varies by threshold, certificate, and section. The code labels this `exception_tds_candidate` → `expected_tds_withholding` as a *candidate*, not certainty. `app/config.py:tds_rate_for()` is the hook to plug in real rules.
-- **Matching model:** 1:1 order↔settlement via outer join. Real Razorpay settlements are often *batched* (many orders in one bank credit + UTR). Next step is an aggregation layer (group by UTR/date, then match sums).
-- **Scale:** SQLite + full-dataframe Pandas is correct for a hackathon demo (60 rows → 10k rows fine). For production: Postgres + incremental reconciliation (only new settlements) + `classify_exceptions_batch()` with cache already ships — re-runs don't re-pay for unchanged rows, and ThreadPool handles thousands in parallel. See `LEDGER_NO_CACHE=1` to force fresh calls.
+- **Synthetic data.** The 80.3% is on Faker data with planted edges. The upload path (BYO CSV) lets you test on *your* data — "it survived data we didn't design" is the stronger claim.
+- **TDS band.** Flat 2% ±0.5pp, category-aware via `tds_rate_for()` but still flat per category — not real TDS/TCS law (thresholds, certificates, sections). Labeled `exception_tds_candidate` → `expected_tds_withholding` as *candidate*, not certainty.
+- **Matching model.** 1:1 outer join. Real Razorpay settlements are often batched (many orders in one UTR/bank credit). Next is an aggregation layer (group by UTR/date, then match sums).
+- **Scale.** SQLite + full-dataframe Pandas is correct for demo (60 → 10k rows fine). For production: Postgres + incremental reconciliation + `classify_exceptions_batch` with hash cache + ThreadPool (already ships; `LEDGER_NO_CACHE=1` to force fresh).
+- **Scoring model.** `app/detection.py` and `app/metrics.py` use synthetic scores to demo cost-sensitive thresholding and windowing. Plugging a real XGBoost/IsolationForest scorer is a one-line `scores = model.predict_proba(X)[:,1]` before `find_optimal_threshold` — the cost, window, and spike logic is model-agnostic.
 
 ---
 
-## What makes it trustworthy?
+## Docs & Troubleshooting
 
-- **Nothing is silently ignored.** Every row gets an audit entry, even duplicates and bad signatures.
-- **Re-runs are safe.** Run the pipeline twice and you get the same result — no duplicates.
-- **Windows-friendly.** No need to delete the database file by hand (which often fails because the app still has it open).
-- **Fails gracefully.** Missing API keys, bad CSV rows, or a locked database don't crash the whole run — they are logged and skipped.
+- `docs/dev-log.md` — real bug (0% match) and how audit_log found it
+- `docs/architecture.png` — diagram (regenerate: `python scripts/generate_architecture.py`)
+- `docs/demo.gif` — walkthrough (regenerate: `python scripts/generate_demo_gif.py`)
+- `data/generate_synthetic_data.py` — deterministic Faker plan (documented planted inventory)
 
----
+**`Failed to fetch: https://github.com/.../tree/main/app`** — that URL is HTML, not a raw file. Use:
 
-## New in this release — Track 02 defense (cost-sensitive, policy, chargeback)
-
-- **Cost-sensitive detection (25x FN cost)**: `app/detection.py` trains its threshold against `cost = 25*FN + 1*FP` (amount-weighted for FN), not accuracy. Rolling windows (`window="1h"/"6h"`) aggregate transactions; risk is flagged only when the window fraud-rate spikes above its historical baseline (`mean + 2*std`). Single-row anomalies that do not spike the window are not flagged — this is how we cut the financial cost of false positives vs naive per-transaction flagging.
-- **Active Chargeback Responder (Track 02)**: `app/chargeback.py` gathers evidence with *read-only* SELECTs (orders, settlement, webhook_events, audit_log) and compiles a structured, cited `ChargebackResponse` (summary, timeline, amount analysis, evidence Cited, recommended action). Status starts as `draft` — human must approve via `POST /human/resolve`. Never auto-submits; defense-only by design.
-- **Strict guardrails & separation**: `app/policy.py` is the *only* place hard outcomes (`approve|step_up|review|block`, `POLICY_VERSION=v1.0-defense-only`) are made — deterministic, auditable, allowlist-enforced. Offensive actions are blocked by keyword guard. `machine_decisions` (auto) and `human_resolutions` (analyst) are separate tables; `human` is authoritative if present (`GET /human/resolutions` vs `GET /machine/decisions`).
-- **Honest metrics (held-out)**: `app/metrics.py` uses a *time-based* train/test split (no leakage). Threshold is fitted on earliest 70%, evaluated on latest 30%. Dashboard and `GET /metrics/honest` show `precision/recall/FPR`, `total_cost = 25*FN+FP`, and explicit **financial cost of false positives** (`FP x Rs 500` review cost) + FN loss. Baseline (flag nothing) cost shown for comparison.
-
-**APIs added**: `POST /detect`, `GET /detect/demo`, `POST /policy/decide`, `GET /chargeback/{order_id}`, `POST /human/resolve`, `GET /machine/decisions`, `GET /human/resolutions`, `GET /metrics/honest`
-
-**Dashboard**: new "Defense, Policy & Honest Metrics" panel — honest metrics card (FP rupee cost), rolling-window spike demo, live policy playground, and chargeback pack compiler.
-
-## Docs
-
-- `docs/dev-log.md` — real bug we hit (0% match rate) and how the audit log helped us find it
-- `docs/architecture.png` — diagram above (generate with `python scripts/generate_architecture.py`)
-- `docs/demo.gif` — animated walkthrough (generate with `python scripts/generate_demo_gif.py`)
-
----
-
-## Troubleshooting
-
-**`Failed to fetch: https://github.com/.../tree/main/app`** — that URL is an HTML page, not a raw file. Don't `fetch` it. Instead:
 ```bash
 git clone https://github.com/abiralpokhrel-learns/ledger-sentinel.git
 cd ledger-sentinel
 ```
-Or fetch raw files via `https://raw.githubusercontent.com/abiralpokhrel-learns/ledger-sentinel/main/app/main.py`. The `app/` folder is tracked — `git status` should show it, and `ls app/` should list 8 files.
 
-**Port already in use** — set `LEDGER_DASHBOARD_PORT` or `LEDGER_CHECK_PORT` before running smoke checks.
+or `https://raw.githubusercontent.com/abiralpokhrel-learns/ledger-sentinel/main/app/main.py` for raw files. `ls app/` should list 12 files.
 
-**DB locked on Windows** — use `python -m app.main --clear-only` instead of deleting `ledger_sentinel.db`.
+**Port in use** — set `LEDGER_DASHBOARD_PORT` / `LEDGER_CHECK_PORT`.
+
+**DB locked on Windows** — `python -m app.main --clear-only` instead of deleting `ledger_sentinel.db`.
+
+**CI fails `ModuleNotFoundError: app`** — ensure `PYTHONPATH=.` (fixed in `.github/workflows/ci.yml`).
 
 ---
 
-*Built with care for the Razorpay AI Buildathon. The goal is not to replace finance teams, but to give them a head start — 80% auto-matched, and a clear explanation for the rest.*
+*Built with care for the Razorpay AI Buildathon. Not to replace finance teams, but to give them a head start — 80% auto-matched, spikes flagged by cost, chargebacks packed with cited evidence, and a clear policy for the rest.*
+

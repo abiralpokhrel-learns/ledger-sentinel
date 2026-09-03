@@ -123,9 +123,9 @@ Razorpay webhook (raw bytes)
    Dashboard + PDF + /metrics/honest (held-out, FP rupee cost)
 ```
 
-![Architecture — Clean flow: deterministic spine, AI only on residue, defense layer](docs/architecture.png)
+![Demo — Ledger Sentinel in action](docs/demo.gif)
 
-*New clean diagram (Pillow, no AI artifacts) — regenerate with `python scripts/generate_architecture_clean.py`. If words ever look blurry, re-run that script.*
+*Live recording of the pipeline + dashboard — regenerate with `python scripts/generate_demo_gif.py`. No AI-generated image — what you see is what the code does.*
 
 **Invariants:** No `DELETE FROM` of DB files needed (`clear_all` is Windows-safe). Re-runs are idempotent. Every outcome — `applied`, `duplicate_skipped`, `rejected`, `matched`, `exception` — has an `audit_log` row.
 
@@ -162,7 +162,6 @@ Razorpay webhook (raw bytes)
 | **Deterministic Policy Engine** — signals → hard outcomes | `app/policy.py` | AI never decides; allowlist blocks offensive actions; versioned |
 | **Honest Metrics** — held-out test, FP rupee cost | `app/metrics.py` | Time-split, no leakage, `FP × ₹500` shown, baseline cost vs saved |
 
-![Demo](docs/demo.gif)
 
 ### Verified Numbers (Synthetic Demo)
 
@@ -509,8 +508,7 @@ ledger-sentinel/
 │   └── test_defense.py      # 10 — cost, policy, chargeback, honest metrics
 ├── docs/
 │   ├── dev-log.md           # real 0% match bug, root cause, audit-log proof
-│   ├── architecture.png
-│   └── demo.gif             # include in README
+│   └── demo.gif             # hero visual in README
 ├── scripts/
 │   ├── dashboard_smoke_check.py
 │   ├── live_webhook_check.py
@@ -550,8 +548,7 @@ We disclose simplifications so judges can evaluate credibility:
 ## Docs & Troubleshooting
 
 - `docs/dev-log.md` — real bug (0% match) and how audit_log found it
-- `docs/architecture.png` — diagram (regenerate: `python scripts/generate_architecture.py`)
-- `docs/demo.gif` — walkthrough (regenerate: `python scripts/generate_demo_gif.py`)
+- - `docs/demo.gif` — hero visual (pipeline + dashboard walkthrough) (regenerate: `python scripts/generate_demo_gif.py`)
 - `data/generate_synthetic_data.py` — deterministic Faker plan (documented planted inventory)
 
 **`Failed to fetch: https://github.com/.../tree/main/app`** — that URL is HTML, not a raw file. Use:

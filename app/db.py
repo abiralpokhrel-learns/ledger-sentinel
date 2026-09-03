@@ -51,19 +51,29 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
+    # isolation_level=None => autocommit; we manage transactions explicitly where needed
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
     except Exception:
         pass
     return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA)
-    conn.commit()
+    try:
+        conn.executescript(SCHEMA)
+        # Helpful index for dashboard queries: outcome filter is the hot path
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_outcome ON audit_log(outcome);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_order ON audit_log(order_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_order ON webhook_events(order_id);")
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        # If DB is locked or corrupted, surface a clear error instead of silent fail
+        raise RuntimeError(f"init_db failed: {e}") from e
 
 
 def clear_all(conn: sqlite3.Connection) -> None:
@@ -138,10 +148,15 @@ def event_exists(conn, event_id) -> bool:
 
 
 def insert_event(conn, event_id, order_id, event_type):
-    conn.execute(
-        "INSERT INTO webhook_events (event_id, order_id, event_type) VALUES (?, ?, ?)",
-        (event_id, order_id, event_type),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO webhook_events (event_id, order_id, event_type) VALUES (?, ?, ?)",
+            (event_id, order_id, event_type),
+        )
+    except sqlite3.IntegrityError:
+        # Race: two deliveries with same event_id at same time
+        # Let caller treat as duplicate
+        raise
 
 
 # --- settlement -------------------------------------------------------------
@@ -164,23 +179,49 @@ def upsert_settlement(conn, order_id, amount_settled, settlement_status, utr, se
 # --- audit log --------------------------------------------------------------
 
 def log_audit(conn, order_id, outcome, reason, classification=None, audit_note=None):
-    conn.execute(
-        """INSERT INTO audit_log (order_id, outcome, reason, classification, audit_note)
-           VALUES (?, ?, ?, ?, ?)""",
-        (order_id, outcome, reason, classification, audit_note),
-    )
-    conn.commit()
+    # Truncate note to avoid blowing up the DB with a huge LLM output
+    if audit_note and len(audit_note) > 2000:
+        audit_note = audit_note[:1997] + "..."
+    try:
+        conn.execute(
+            """INSERT INTO audit_log (order_id, outcome, reason, classification, audit_note)
+               VALUES (?, ?, ?, ?, ?)""",
+            (order_id, outcome, reason, classification, audit_note),
+        )
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            # Retry once after a short wait — common on Windows with WAL
+            import time
+            time.sleep(0.2)
+            conn.execute(
+                """INSERT INTO audit_log (order_id, outcome, reason, classification, audit_note)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (order_id, outcome, reason, classification, audit_note),
+            )
+            conn.commit()
+        else:
+            raise
 
 
 # --- loaders for reconciliation / dashboard ---------------------------------
 
 def load_orders_df(conn) -> pd.DataFrame:
-    return pd.read_sql("SELECT * FROM orders", conn)
+    try:
+        return pd.read_sql("SELECT * FROM orders", conn)
+    except Exception:
+        return pd.DataFrame(columns=["order_id", "amount", "mdr", "gst", "category", "status"])
 
 
 def load_settlement_df(conn) -> pd.DataFrame:
-    return pd.read_sql("SELECT * FROM settlement", conn)
+    try:
+        return pd.read_sql("SELECT * FROM settlement", conn)
+    except Exception:
+        return pd.DataFrame(columns=["order_id", "amount_settled", "settlement_status", "utr", "settlement_date"])
 
 
 def load_audit_df(conn) -> pd.DataFrame:
-    return pd.read_sql("SELECT * FROM audit_log ORDER BY id", conn)
+    try:
+        return pd.read_sql("SELECT * FROM audit_log ORDER BY id", conn)
+    except Exception:
+        return pd.DataFrame(columns=["id", "order_id", "outcome", "reason", "classification", "audit_note", "created_at"])

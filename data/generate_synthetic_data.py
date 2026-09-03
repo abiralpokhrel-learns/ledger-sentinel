@@ -179,7 +179,8 @@ def main():
                 "amount_settled": settled,
                 "settlement_status": s_status,
                 "utr": fake.bothify("UTR############"),
-                "settlement_date": fake.date_this_year().isoformat(),
+                # Deterministic fixed 2026 date so regeneration doesn't diff across days
+                "settlement_date": f"2026-{random.randint(1,8):02d}-{random.randint(1,28):02d}",
             }
         )
 
@@ -191,7 +192,7 @@ def main():
             "amount_settled": round(random.uniform(100, 1000), 2),
             "settlement_status": "captured",
             "utr": fake.bothify("UTR############"),
-            "settlement_date": fake.date_this_year().isoformat(),
+            "settlement_date": f"2026-{random.randint(1,8):02d}-{random.randint(1,28):02d}",
         }
     )
 

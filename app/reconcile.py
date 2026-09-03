@@ -10,22 +10,51 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.config import TOLERANCE, TDS_RATE, TDS_BAND
+from app.config import TOLERANCE, TDS_RATE, TDS_BAND, tolerance
 
 # settlement_status values that mean "money actually moved"
 SETTLED_STATES = {"captured"}
 
 
+def _coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
 def prepare_orders(orders_df: pd.DataFrame) -> pd.DataFrame:
     df = orders_df.copy()
+    if df.empty:
+        # Ensure expected columns exist for downstream merge
+        for col in ["order_id", "amount", "mdr", "gst", "category", "status"]:
+            if col not in df.columns:
+                df[col] = pd.Series(dtype="object" if col in ("order_id", "category", "status") else "float")
+        df["amount_calc"] = pd.Series(dtype=float)
+        return df
+    df = _coerce_numeric(df, ["amount", "mdr", "gst"])
+    # Fill missing MDR/GST with 0 so net calc doesn't become NaN
+    df["mdr"] = df["mdr"].fillna(0)
+    df["gst"] = df["gst"].fillna(0)
     df["amount_calc"] = (df["amount"] - df["mdr"] - df["gst"]).round(2)
     return df
 
 
 def reconcile(orders_df: pd.DataFrame, settlement_df: pd.DataFrame):
     """Return (matched, exceptions) DataFrames, both with a `reason` column."""
+    # Defensive: deduplicate order_id (last wins) to avoid cartesian explosion
+    # and normalize column names
+    if "order_id" not in orders_df.columns or "order_id" not in settlement_df.columns:
+        raise ValueError("Both orders and settlement must have 'order_id' column")
+    orders_df = orders_df.drop_duplicates(subset=["order_id"], keep="last")
+    settlement_df = settlement_df.drop_duplicates(subset=["order_id"], keep="last")
+
     orders = prepare_orders(orders_df)
     settled = settlement_df.copy()
+    # Coerce settlement amounts to numeric; non-numeric becomes NaN -> missing_settlement
+    settled = _coerce_numeric(settled, ["amount_settled"])
+    if "amount_settled" not in settled.columns:
+        settled["amount_settled"] = pd.Series(dtype=float)
 
     merged = orders.merge(
         settled, on="order_id", how="outer", suffixes=("_calc", "_settled")
@@ -47,6 +76,7 @@ def reconcile(orders_df: pd.DataFrame, settlement_df: pd.DataFrame):
         return calc_moved == sett_moved
 
     merged["status_consistent"] = merged.apply(status_consistent, axis=1)
+    tol = tolerance()
 
     # Classify each merged row.
     def classify(row) -> str:
@@ -56,11 +86,19 @@ def reconcile(orders_df: pd.DataFrame, settlement_df: pd.DataFrame):
             return "missing_settlement"     # order exists, no settlement
         if not row["status_consistent"]:
             return "status_mismatch"        # late-auth flip etc.
-        if row["diff"] <= TOLERANCE:
+        if row["diff"] <= tol:
             return "matched"
         # Above tolerance: candidate for AI. Tag a hint for the classifier.
-        gap_rate = (row["diff"] / row["amount_calc"]) if row["amount_calc"] else 0
-        if TDS_RATE - TDS_BAND <= gap_rate <= TDS_RATE + TDS_BAND:
+        # Use gross amount for TDS rate check; only shortfalls (settled < calc) can be TDS
+        # diff is abs, so also check settled < calc
+        is_shortfall = row["amount_settled"] < row["amount_calc"]
+        if is_shortfall and row["amount"] and not pd.isna(row["amount"]) and row["amount"] != 0:
+            gap_rate = row["diff"] / float(row["amount"])
+            if TDS_RATE - TDS_BAND <= gap_rate <= TDS_RATE + TDS_BAND:
+                return "exception_tds_candidate"
+        # Fallback: also try calc-based rate for backwards compat (small orders rounding)
+        gap_rate_calc = (row["diff"] / row["amount_calc"]) if row["amount_calc"] else 0
+        if is_shortfall and TDS_RATE - TDS_BAND <= gap_rate_calc <= TDS_RATE + TDS_BAND:
             return "exception_tds_candidate"
         return "exception_unexplained"
 

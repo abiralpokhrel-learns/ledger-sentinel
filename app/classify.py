@@ -70,18 +70,46 @@ def _heuristic_classify(row: dict) -> dict:
     }
 
 
+# Deterministic priority order for parsing — set iteration is random
+VALID_ORDERED = ["expected_tds_withholding", "late_authorization_flip", "unresolved"]
+
+_anthropic_client = None
+
+
+def _get_client():
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
+    key = anthropic_api_key()
+    if not key:
+        return None
+    import anthropic
+
+    _anthropic_client = anthropic.Anthropic(api_key=key, timeout=15.0, max_retries=1)
+    return _anthropic_client
+
+
 def _parse(response_text: str) -> dict:
-    first_line = response_text.strip().splitlines()[0].strip().strip('"').strip("'")
-    found = None
-    for label in VALID:
-        if label in response_text:
-            found = label
-            break
-    classification = found or "unresolved"
-    note = response_text.strip()
+    text = response_text.strip()
+    # Priority 1: first line is exactly a valid label (common LLM format)
+    first_line = text.splitlines()[0].strip().strip('"').strip("'").strip()
+    if first_line in VALID:
+        classification = first_line
+    else:
+        # Priority 2: search in deterministic order
+        found = None
+        for label in VALID_ORDERED:
+            if label in text:
+                found = label
+                break
+        classification = found or "unresolved"
+    note = text.strip()
     if classification in note:
         # keep the note but drop the bare label line for readability
         note = re.sub(rf"^\s*{re.escape(classification)}\s*[\n:]*", "", note).strip()
+    # Truncate to avoid DB bloat / UI overflow
+    if len(note) > 500:
+        note = note[:497] + "..."
     return {"classification": classification, "audit_note": note or "(no note returned)"}
 
 
@@ -90,9 +118,10 @@ def classify_exception(row: dict) -> dict:
     if not key:
         return _heuristic_classify(row)
 
-    import anthropic  # imported lazily so the demo runs without the SDK installed
+    client = _get_client()
+    if client is None:
+        return _heuristic_classify(row)
 
-    client = anthropic.Anthropic(api_key=key)
     prompt = CLASSIFY_PROMPT.format(
         amount=row.get("amount", ""),
         amount_calc=row.get("amount_calc", ""),
@@ -108,8 +137,14 @@ def classify_exception(row: dict) -> dict:
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
+        # Defensive: ensure content exists
+        if not resp.content or not hasattr(resp.content[0], "text"):
+            raise ValueError("empty response")
         return _parse(resp.content[0].text)
     except Exception as exc:  # never let the AI block the pipeline
+        # Log once, fallback deterministically
         fallback = _heuristic_classify(row)
-        fallback["audit_note"] = f"[AI call failed: {exc}] {fallback['audit_note']}"
+        # Don't leak full exception to audit_note if it contains secrets
+        short_exc = str(exc)[:120].replace("\n", " ")
+        fallback["audit_note"] = f"[AI call failed: {short_exc}] {fallback['audit_note']}"
         return fallback

@@ -8,6 +8,7 @@ entire point of HMAC verification, so we centralise it here.
 from __future__ import annotations
 
 import os
+import warnings
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,7 +19,19 @@ DEFAULT_WEBHOOK_SECRET = "ledger_sentinel_dev_secret"
 
 
 def webhook_secret() -> str:
-    return os.getenv("WEBHOOK_SECRET", DEFAULT_WEBHOOK_SECRET)
+    secret = os.getenv("WEBHOOK_SECRET", DEFAULT_WEBHOOK_SECRET)
+    if secret == DEFAULT_WEBHOOK_SECRET and os.getenv("LEDGER_STRICT", "").lower() in ("1", "true", "yes"):
+        raise RuntimeError(
+            "WEBHOOK_SECRET is not set and LEDGER_STRICT=1 — "
+            "refusing to run with dev default secret. Set WEBHOOK_SECRET in .env"
+        )
+    if secret == DEFAULT_WEBHOOK_SECRET:
+        warnings.warn(
+            "Using dev default WEBHOOK_SECRET — set WEBHOOK_SECRET in .env for real use",
+            UserWarning,
+            stacklevel=2,
+        )
+    return secret
 
 
 def db_path() -> str:
@@ -34,7 +47,22 @@ def anthropic_model() -> str:
 
 
 def mcp_mode() -> str:
-    return os.getenv("LEDGER_MCP_MODE", "remote")
+    mode = os.getenv("LEDGER_MCP_MODE", "remote").lower()
+    if mode not in ("remote", "local"):
+        warnings.warn(f"Unknown LEDGER_MCP_MODE={mode!r}, falling back to 'remote'", UserWarning, stacklevel=2)
+        return "remote"
+    return mode
+
+
+def tolerance() -> float:
+    try:
+        return float(os.getenv("LEDGER_TOLERANCE", "0.01"))
+    except ValueError:
+        return 0.01
+
+
+def is_strict() -> bool:
+    return os.getenv("LEDGER_STRICT", "").lower() in ("1", "true", "yes")
 
 
 # --- reconciliation constants ----------------------------------------------

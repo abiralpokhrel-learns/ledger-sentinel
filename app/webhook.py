@@ -18,6 +18,7 @@ import hmac
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel, field_validator
 
 from app import db
 from app.config import webhook_secret
@@ -32,6 +33,30 @@ STATE_RANK = {
     "refunded": 3,
     "failed": 3,
 }
+
+VALID_STATES = set(STATE_RANK.keys())
+
+
+class WebhookPayload(BaseModel):
+    event_id: str
+    order_id: str
+    event_type: str
+
+    @field_validator("event_id", "order_id", "event_type")
+    @classmethod
+    def not_empty(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("must be non-empty string")
+        if len(v) > 200:
+            raise ValueError("too long")
+        return v.strip()
+
+    @field_validator("event_type")
+    @classmethod
+    def valid_state(cls, v: str) -> str:
+        if v not in VALID_STATES:
+            raise ValueError(f"invalid event_type {v!r}, expected one of {sorted(VALID_STATES)}")
+        return v
 
 
 # --- gate 1: signature ------------------------------------------------------
@@ -48,8 +73,11 @@ def verify_signature(raw_body: bytes, signature: Optional[str], secret: str) -> 
 def is_forward_transition(current_state: Optional[str], incoming_state: str) -> bool:
     if current_state is None:
         return True
-    incoming = STATE_RANK.get(incoming_state, 0)
-    current = STATE_RANK.get(current_state, 0)
+    # Unknown states are defensive: treat as not forward so we don't corrupt ledger
+    if incoming_state not in STATE_RANK or current_state not in STATE_RANK:
+        return False
+    incoming = STATE_RANK[incoming_state]
+    current = STATE_RANK[current_state]
     return incoming > current
 
 
@@ -64,6 +92,8 @@ def try_record_event(conn, event_id, order_id, event_type) -> str:
       applied             — forward transition applied
       no_order            — order_id unknown (still recorded for the log)
     """
+    if not event_id or not order_id or not event_type:
+        return "out_of_order_dropped"
     if db.event_exists(conn, event_id):
         return "duplicate_skipped"
 
@@ -71,7 +101,11 @@ def try_record_event(conn, event_id, order_id, event_type) -> str:
     if not is_forward_transition(current_state, event_type):
         return "out_of_order_dropped"
 
-    db.insert_event(conn, event_id, order_id, event_type)
+    try:
+        db.insert_event(conn, event_id, order_id, event_type)
+    except Exception:
+        # IntegrityError race — another thread inserted same event_id
+        return "duplicate_skipped"
     if current_state is None:
         # Order may already exist (loaded from orders.csv with a real amount).
         # Only create a minimal stub if it is genuinely absent.
@@ -86,20 +120,39 @@ def try_record_event(conn, event_id, order_id, event_type) -> str:
 
 # --- HTTP endpoint (real webhook ingestion) ---------------------------------
 
+MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB — Razorpay payloads are small; block DoS
+
+
 @app.post("/webhook")
 async def razorpay_webhook(request: Request):
     raw_body = await request.body()  # MUST be raw bytes, parsed only after verify
+    if len(raw_body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    if len(raw_body) == 0:
+        raise HTTPException(status_code=400, detail="empty body")
     signature = request.headers.get("x-razorpay-signature")
     secret = webhook_secret()
 
     if not verify_signature(raw_body, signature, secret):
         raise HTTPException(status_code=400, detail="signature verification failed")
 
-    payload = await request.json()  # parse ONLY after verification
-    event_id = payload.get("event_id")
-    order_id = payload.get("order_id")
-    event_type = payload.get("event_type")
+    try:
+        payload_raw = await request.json()  # parse ONLY after verification
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
 
-    conn = request.app.state.db
-    verdict = try_record_event(conn, event_id, order_id, event_type)
+    try:
+        payload = WebhookPayload.model_validate(payload_raw)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid payload: {e}")
+
+    # Handle case where app.state.db is not yet initialized (e.g., TestClient without lifespan)
+    conn = getattr(request.app.state, "db", None)
+    if conn is None:
+        from app.config import db_path as _db_path
+        conn = db.get_connection(_db_path())
+        db.init_db(conn)
+        request.app.state.db = conn
+
+    verdict = try_record_event(conn, payload.event_id, payload.order_id, payload.event_type)
     return {"status": "ok", "verdict": verdict}

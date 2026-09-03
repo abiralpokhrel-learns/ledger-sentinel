@@ -76,6 +76,17 @@ class RazorpayMCP:
 def fetch_settlements_sync() -> dict:
     """Convenience wrapper; returns {} if the server is unavailable."""
     try:
+        # asyncio.run fails if already inside an event loop (e.g., FastAPI)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(asyncio.run, RazorpayMCP().fetch_all_settlements())
+                return fut.result(timeout=30)
         return asyncio.run(RazorpayMCP().fetch_all_settlements())
     except Exception as exc:  # pragma: no cover - depends on external creds
         print(f"[mcp] settlement fetch unavailable ({exc}); using synthetic file.")

@@ -6,7 +6,21 @@
 
 [![CI](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) [![Tests 30 passed](https://img.shields.io/badge/tests-30%20passed-brightgreen)](#testing)
 
-Ledger Sentinel reconciles *what you sold* against *what Razorpay actually settled* — then isolates the ambiguous residue for AI explanation. The 80% that can be checked exactly is checked exactly. AI only explains the rest, and a deterministic policy engine decides.
+> **Razorpay merchants shouldn't need spreadsheets to reconcile payments.**
+>
+> Ledger Sentinel automatically reconciles orders against settlements, explains only the exceptions with AI, detects suspicious spikes, and creates audit-ready evidence — without giving AI control over money.
+
+**In one line:** a trustworthy AI financial controller for Razorpay merchants — **80% auto-matched, full audit trail, AI only on the residue.**
+
+**How to read this repo:**
+
+*   **Primary product — Reconciliation (Track 04 hero):** orders → expected settlement → actual settlement → discrepancies, with tolerance handling. The demo you should watch first.
+*   **AI layer:** explains ambiguous exceptions (not reconciliation itself). Deterministic rules tell *that* they don't match; the LLM tells *why*.
+*   **Defense layer (Track 02 extension):** cost-sensitive spike detection + deterministic policy + chargeback evidence pack — "and here's what else we shipped."
+
+---
+
+**First 30 seconds for judges:** What problem? Reconciliation is manual spreadsheets. Why Razorpay? Automated reconciliation is on their careers roadmap. What did we build? 80% auto-matched with audit trail. Why AI? Only to explain ambiguous exceptions. What makes it different? Deterministic-first — AI never touches money. How to demo? `python -m app.main` → `streamlit run dashboard/app.py` (61→49/12, one-click PDF).
 
 ---
 
@@ -83,6 +97,8 @@ This is not an invented hackathon problem. Razorpay's own careers page lists *au
 | **5. Defend** | "Is this a real spike, and what is the proof pack?" | Cost-sensitive rolling-window spike detector + chargeback evidence compiler (drafts only) | Signals only |
 
 > Core idea: Everything that can be checked for sure *is* checked for sure. AI only explains the few lines where a human would have to guess — and even then it only writes a note. A separate, fixed policy decides what happens next.
+>
+> **Why an LLM at all?** Deterministic rules can tell *that* two records don't reconcile. They cannot reliably explain ambiguous gaps caused by combinations of status, timing, fees, TDS and operational context. The LLM is restricted to that semantic interpretation layer — it never reconciles, never moves money.
 
 ---
 
@@ -128,6 +144,29 @@ Razorpay webhook (raw bytes)
 *Live recording of the pipeline + dashboard — regenerate with `python scripts/generate_demo_gif.py`. No AI-generated image — what you see is what the code does.*
 
 **Invariants:** No `DELETE FROM` of DB files needed (`clear_all` is Windows-safe). Re-runs are idempotent. Every outcome — `applied`, `duplicate_skipped`, `rejected`, `matched`, `exception` — has an `audit_log` row.
+
+---
+
+## How to Demo It (3 Minutes)
+
+**One beautiful story — 10 deliberately different orders:**
+
+| # | Scenario | What the judge sees |
+|---|----------|---------------------|
+| 1 | Exact match | Green — auto-reconciled |
+| 2 | Rounding (Rs 0.01) | Green — tolerance absorbs noise where `==` would fail |
+| 3 | TDS deduction (2%) | Orange — `expected_tds_withholding` + AI note: "likely TDS withholding, verify certificate" — AI did NOT change the record |
+| 4 | Late authorization flip | Orange — `late_authorization_flip` — failed in orders, captured in settlement |
+| 5 | Missing settlement | Orange — `missing_settlement` |
+| 6 | Missing order (orphan payout) | Orange — `missing_order` — UTR with no order |
+| 7 | Status mismatch | Orange — unexplained gap, `review` |
+| 8 | Suspicious spike | Defense panel: 6h window fraud_rate spikes above `mean+2σ` → policy `step_up`/`block` |
+| 9 | Chargeback case | One click → cited evidence pack (orders + settlement + webhook log + UTR), status `draft` — human must file |
+| 10 | Honest metrics | Held-out split: precision/recall/FP cost in rupees vs baseline — tradeoff visible |
+
+Then show the dashboard landing: **₹X processed → 80.3% auto-reconciled → ₹Y at risk → 12 exceptions → 3 spikes → 4 for human review → drill down.**
+
+> Reconciliation is the hero. Defense is "and here's what else we shipped." Don't split time evenly — lead with the 80% story.
 
 ---
 
@@ -438,7 +477,7 @@ All via environment (see `.env.example`). Dev defaults allow `generate_synthetic
 
 - `TOLERANCE = 0.01` — rounding slack
 - `TDS_RATE = 0.02`, `TDS_BAND = 0.005` — `tds_rate_for(category)` is category-aware in shape but today returns a **flat 2% for every category** (intentionally simplified — real TDS varies by threshold/certificate/section; rehearsed answer for judges)
-- `FN_COST = 25`, `FP_COST = 1`, `FP_REVIEW_COST_RUPEES = 500` — defense cost
+- `FN_COST = 25  # configurable demonstration ratio — not a claim about Razorpay's actual fraud economics`, `FP_COST = 1`, `FP_REVIEW_COST_RUPEES = 500` — defense cost
 
 ---
 

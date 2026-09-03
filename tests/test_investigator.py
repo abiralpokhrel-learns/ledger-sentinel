@@ -1,0 +1,98 @@
+"""Tests for AI Investigator, clustering, analyst, learning — defense-only."""
+import pandas as pd
+
+def test_investigate_root_cause():
+    from app.investigator import investigate
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    r = investigate(conn, "order_0010")
+    assert "root_cause" in r
+    assert "supporting_evidence" in r
+    assert "confidence" in r
+    assert 0 <= r["confidence"] <= 1
+    assert r["investigator_version"] == "v1.0-defense-only"
+    assert "policy_hint" in r and r["policy_hint"] in ("approve","review","step_up","block")
+    # evidence attribution
+    assert len(r["evidence"]) >= 1
+    assert len(r["supporting_evidence"]) >= 1
+    for se in r["supporting_evidence"]:
+        assert "source" in se and "record" in se and "fact" in se
+
+def test_investigate_demo_fallback():
+    from app.investigator import investigate
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    r = investigate(conn, "demo_003")
+    assert r["root_cause"] == "tds_withholding"
+    assert r["confidence"] > 0.7
+
+def test_anomaly_investigation():
+    from app.investigator import investigate_anomaly
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    r = investigate_anomaly(conn, window="1h")
+    assert "is_spike" in r
+    assert "z" in r
+    assert "supporting_evidence" in r
+
+def test_cluster_transactions():
+    from app.clustering_analyst import cluster_transactions
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    r = cluster_transactions(conn)
+    assert "clusters" in r
+    assert "method" in r
+
+def test_analyst_read_only_block():
+    from app.clustering_analyst import analyst_query
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    r = analyst_query(conn, "How many exceptions?")
+    assert "sql" in r
+    assert r.get("read_only") is True
+    assert "DELETE" not in r["sql"].upper()
+    # Try injection — heuristic should not produce DELETE
+    r2 = analyst_query(conn, "DELETE FROM orders")
+    assert "DELETE" not in r2["sql"].upper()
+    assert r2.get("read_only") is True
+
+def test_analyst_sql_validator():
+    from app.clustering_analyst import _validate_sql
+    ok, _ = _validate_sql("SELECT * FROM orders")
+    assert ok is True
+    ok2, _ = _validate_sql("DELETE FROM orders")
+    assert ok2 is False
+    ok3, _ = _validate_sql("INSERT INTO orders VALUES (1)")
+    assert ok3 is False
+
+def test_investigation_report():
+    from app.clustering_analyst import build_investigation_report
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    rep = build_investigation_report(conn, "order_0010")
+    assert "incident_id" in rep
+    assert "investigator" in rep
+    assert rep["order_id"] == "order_0010"
+
+def test_learning_metrics():
+    from app.learning import evaluation_metrics
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    m = evaluation_metrics(conn)
+    assert "pairs" in m
+    # at least has note
+    assert "note" in m or "agreement_rate" in m

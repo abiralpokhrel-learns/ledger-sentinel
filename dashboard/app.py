@@ -228,6 +228,176 @@ with st.expander("10-Order Beautiful Story — click to see the judge-legible de
     except Exception as e:
         st.caption(f"Demo story unavailable: {e}")
 
+# --- AI Investigator — central AI component (preserves safety boundary) ---
+st.markdown("### AI Investigator — higher-value reasoning, still defense-only")
+st.caption("AI reasons → evidence → policy hint → human decides. AI never moves money or writes the ledger.")
+inv_c1, inv_c2 = st.columns([1.2, 1])
+with inv_c1:
+    inv_order = st.text_input("Investigate order", value="demo_003", placeholder="demo_003 or order_0010", key="inv_order")
+    if st.button("Investigate", key="btn_investigate"):
+        try:
+            from app.investigator import investigate as _inv
+            from app.config import db_path as _dbp
+            import app.db as _db
+            _conn = _db.get_connection(_dbp())
+            _db.init_db(_conn)
+            _res = _inv(_conn, inv_order.strip())
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            st.markdown(f"**Root cause:** `{_res.get('root_cause')}`  •  Confidence: **{_res.get('confidence',0):.0%}**  •  Policy hint: `{_res.get('policy_hint')}`")
+            st.markdown("**Evidence:**")
+            for ev in _res.get("evidence", [])[:6]:
+                st.markdown(f"- {ev}")
+            with st.expander("Supporting evidence (cited)"):
+                import pandas as _pd
+                _se = _res.get("supporting_evidence", [])
+                if _se:
+                    st.dataframe(_pd.DataFrame(_se), use_container_width=True, height=180)
+                else:
+                    st.caption("No cited evidence")
+            c_a, c_b = st.columns(2)
+            with c_a:
+                st.markdown("**Alternative hypotheses**")
+                for h in _res.get("alternative_hypotheses", [])[:4]:
+                    st.markdown(f"- {h}")
+            with c_b:
+                st.markdown("**Missing evidence**")
+                for m in _res.get("missing_evidence", [])[:4]:
+                    st.markdown(f"- {m}")
+            st.info(f"Recommended: {_res.get('recommended_next_step','')}")
+            st.caption(f"Investigator {_res.get('investigator_version','')} • heuristic={_res.get('is_heuristic')} • Human approval required: Yes")
+        except Exception as e:
+            st.error(f"Investigation failed: {e}")
+with inv_c2:
+    st.markdown("**Anomaly investigation (spike)**")
+    _win = st.selectbox("Window", ["1h", "6h", "1D"], index=0, key="inv_win")
+    _z = st.slider("Z threshold", 1.0, 4.0, 2.0, 0.5, key="inv_z")
+    if st.button("Investigate spike", key="btn_spike"):
+        try:
+            from app.investigator import investigate_anomaly as _ia
+            from app.config import db_path as _dbp2
+            import app.db as _db2
+            _conn2 = _db2.get_connection(_dbp2())
+            _db2.init_db(_conn2)
+            _r2 = _ia(_conn2, window=_win, spike_threshold_z=_z)
+            try:
+                _conn2.close()
+            except Exception:
+                pass
+            badge = "badge-red" if _r2.get("is_spike") else "badge-green"
+            st.markdown(f"<span class='badge {badge}'>{'SPIKE' if _r2.get('is_spike') else 'no spike'}</span> z={_r2.get('z')} confidence {_r2.get('confidence',0):.0%}", unsafe_allow_html=True)
+            st.markdown(f"**{_r2.get('root_cause')}** — {_r2.get('recommended_next_step')}")
+            for ev in _r2.get("evidence", [])[:4]:
+                st.markdown(f"- {ev}")
+        except Exception as e:
+            st.error(f"Spike investigation failed: {e}")
+    st.divider()
+    st.markdown("**Behavioral clusters**")
+    if st.button("Cluster transactions", key="btn_cluster"):
+        try:
+            from app.clustering_analyst import cluster_transactions as _cl
+            from app.config import db_path as _dbp3
+            import app.db as _db3
+            _conn3 = _db3.get_connection(_dbp3())
+            _db3.init_db(_conn3)
+            _cr = _cl(_conn3, k=3)
+            try:
+                _conn3.close()
+            except Exception:
+                pass
+            import pandas as _pd2
+            if _cr.get("clusters"):
+                st.dataframe(_pd2.DataFrame(_cr["clusters"]), use_container_width=True, height=160)
+                st.caption(f"Method: {_cr.get('method')} — per-cluster thresholds can then apply via policy")
+            else:
+                st.caption(str(_cr.get("note") or _cr.get("error") or "No clusters"))
+        except Exception as e:
+            st.error(f"Clustering failed: {e}")
+
+# --- NL Analyst (read-only) + Reports ---
+st.markdown("### Analyst & Reports — business artifacts, not chat")
+ana_c1, ana_c2 = st.columns([1.4, 1])
+with ana_c1:
+    st.markdown("**NL Analyst (read-only SQL)**")
+    st.caption("Ask in plain English — AI writes SELECT, validator blocks writes, then explains. Never INSERT/UPDATE/DELETE.")
+    _q = st.text_input("Question", value="How much amount is at risk in exceptions?", placeholder="How many TDS candidates?", key="analyst_q")
+    if st.button("Ask analyst", key="btn_analyst"):
+        try:
+            from app.clustering_analyst import analyst_query as _aq
+            from app.config import db_path as _dbp4
+            import app.db as _db4
+            _conn4 = _db4.get_connection(_dbp4())
+            _db4.init_db(_conn4)
+            _ar = _aq(_conn4, _q)
+            try:
+                _conn4.close()
+            except Exception:
+                pass
+            if _ar.get("error"):
+                st.error(f"{_ar.get('error')} — SQL: `{_ar.get('sql','')[:200]}`")
+            else:
+                st.code(_ar.get("sql",""), language="sql")
+                import pandas as _pd3
+                if _ar.get("rows"):
+                    st.dataframe(_pd3.DataFrame(_ar["rows"]), use_container_width=True, height=140)
+                st.success(_ar.get("explanation",""))
+                st.caption(f"Source: {_ar.get('source')} • read_only={_ar.get('read_only')}")
+        except Exception as e:
+            st.error(f"Analyst failed: {e}")
+with ana_c2:
+    st.markdown("**Investigation report (PDF)**")
+    st.caption("Incident #LS-xxxx — evidence-cited artifact with human approval required.")
+    _rep_order = st.text_input("Order for report", value="demo_003", key="rep_order")
+    if st.button("Build report data", key="btn_report"):
+        try:
+            from app.clustering_analyst import build_investigation_report as _bir
+            from app.config import db_path as _dbp5
+            import app.db as _db5
+            _conn5 = _db5.get_connection(_dbp5())
+            _db5.init_db(_conn5)
+            _rr = _bir(_conn5, _rep_order.strip())
+            try:
+                _conn5.close()
+            except Exception:
+                pass
+            _inv2 = _rr.get("investigator", {})
+            st.markdown(f"**{_rr.get('title')}**")
+            st.markdown(f"Root cause: `{_inv2.get('root_cause')}` • Confidence: {_inv2.get('confidence',0):.0%}")
+            st.markdown(f"Evidence: {len(_inv2.get('evidence',[]))} facts • Supporting: {len(_inv2.get('supporting_evidence',[]))} cited")
+            st.caption(f"Download via API: GET /investigate/{_rep_order.strip()}/report.pdf")
+            # Offer direct download if we can render
+            try:
+                from app.clustering_analyst import render_investigation_pdf as _rip
+                import tempfile
+                _tmp = tempfile.mktemp(suffix=".pdf")
+                _rip(_rr, _tmp)
+                with open(_tmp, "rb") as _f:
+                    st.download_button("Download PDF", data=_f.read(), file_name=f"investigation_{_rep_order.strip()}.pdf", mime="application/pdf", key="dl_report")
+            except Exception as _e:
+                st.caption(f"PDF render unavailable in this env: {_e}")
+        except Exception as e:
+            st.error(f"Report failed: {e}")
+    st.divider()
+    st.markdown("**Closed-loop learning**")
+    if st.button("Show learning metrics", key="btn_learning"):
+        try:
+            from app.learning import evaluation_metrics as _em
+            from app.config import db_path as _dbp6
+            import app.db as _db6
+            _conn6 = _db6.get_connection(_dbp6())
+            _db6.init_db(_conn6)
+            _lm = _em(_conn6)
+            try:
+                _conn6.close()
+            except Exception:
+                pass
+            st.json(_lm)
+            st.caption("Pairs = orders with both machine + human decisions. Use /learning/dataset to export for prompt improvement.")
+        except Exception as e:
+            st.error(f"Learning metrics failed: {e}")
+
 st.divider()
 
 # Filters + exception table

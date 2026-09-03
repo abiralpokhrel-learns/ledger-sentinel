@@ -192,7 +192,22 @@ Then show the dashboard landing: **₹X processed → 80.3% auto-reconciled → 
 | Live webhook feed | Proves pipeline is real |
 | Defense panel (see below) | Track 02 differentiation |
 
-### Defense — Track 02 Differentiation (New)
+### AI Investigator — Higher-Value Reasoning (New — preserves safety boundary)
+
+> **AI reasons → evidence → policy hint → human decides. AI never moves money.**
+
+| Capability | What it does | Safety |
+|------------|--------------|--------|
+| **Root-cause investigator** (`app/investigator.py`) | Per-exception: `root_cause` + `confidence` + `evidence[]` + `supporting_evidence[{source,record,fact}]` + `alternative_hypotheses` + `missing_evidence` + `recommended_next_step` + `policy_hint` | Read-only gather (SELECTs only), evidence-attributed, heuristic fallback |
+| **Anomaly investigator** | Spike window → "12 cards / 9 IPs / Rs 1,400 cluster vs 3–5/10min baseline" → `step_up`/`block` with `z` score | Signal-only, policy decides |
+| **Transaction clustering** (`app/clustering_analyst.py`) | Behavioral segments (value tiers + status, KMeans if sklearn available) → per-cluster thresholds via `policy_hint` | Deterministic heuristic, ML is optional |
+| **Investigation reports** | Incident `LS-xxxx` PDF — summary, evidence, cited records, risk, human approval required — `GET /investigate/{id}/report.pdf` | Business artifact, not chat |
+| **NL Analyst (read-only SQL)** (`POST /analyst/query`) | "How much at risk last week?" → `SELECT` → validator blocks `INSERT/UPDATE/DELETE/DROP` → result + plain-English explanation | `FORBIDDEN` + `ALLOWED_TABLES` validator, `read_only=true` |
+| **Closed-loop learning** (`app/learning.py`) | `machine_decisions` vs `human_resolutions` → `agreement_rate`, `confusion`, `evaluation_dataset` export for prompt improvement | No auto-training, human is supervisor |
+
+**Try it:** `GET /investigate/order_0010` (TDS), `GET /investigate/demo_003` (demo fallback), `GET /investigate/anomaly/spike?window=1h`, `GET /clusters`, `POST /analyst/query`, `GET /learning/metrics`
+
+### Defense — Track 02 Differentiation
 
 | Feature | Module | What it proves |
 |---------|--------|----------------|
@@ -395,6 +410,13 @@ streamlit run dashboard/app.py   # → http://localhost:8501
 | `POST` | `/reconcile-upload` | Upload `orders` + `settlement` CSVs (multipart, 5 MB + 10k row caps) | Amount-only, labeled delta |
 | `GET` | `/reconcile/batched` | Batched settlement view (UTR/date groups) | Shows batch-aware summary + `batched_groups` |
 | `GET` | `/demo/story` | 10-order beautiful story (judge-legible) | Each row a different path + AI moment + batched note |
+| `GET` | `/investigate/{order_id}` | AI root-cause + evidence attribution | Read-only, cited, policy hint |
+| `GET` | `/investigate/{order_id}/report.pdf` | Investigation incident PDF | LS-xxxx artifact, human approval |
+| `GET` | `/investigate/anomaly/spike` | Spike investigation | `window=1h` `z=2.0` → evidence + risk |
+| `GET` | `/clusters` | Behavioral transaction clusters | Heuristic + KMeans segments |
+| `POST` | `/analyst/query` | NL → read-only SQL → explanation | Validator blocks writes |
+| `GET` | `/learning/metrics` | Machine vs human agreement | Closed-loop evaluation |
+| `GET` | `/learning/dataset` | Paired dataset export | For prompt improvement |
 | `POST` | `/run-pipeline?fresh=true` | Trigger full pipeline via HTTP | — |
 | `POST` | `/detect` | Cost-sensitive detection on `transactions[]` | Signal-only |
 | `GET` | `/detect/demo` | Synthetic detection demo | Held-out |
@@ -537,6 +559,10 @@ ledger-sentinel/
 │   ├── metrics.py           # held-out time-split, FP rupee cost
 │   ├── assistant.py         # AI Finance Assistant (chat)
 │   ├── report.py            # PDF audit report (fpdf2)
+│   ├── investigator.py      # AI Financial Investigator (root-cause + anomaly, evidence-attributed)
+│   ├── clustering_analyst.py # clustering + NL analyst (read-only SQL) + investigation reports
+│   ├── learning.py          # closed-loop human-feedback (machine vs human)
+│   ├── reconcile_batched.py # batched settlement (UTR/date groups)
 │   ├── db.py                # SQLite WAL: orders, webhook_events, settlement,
 │   │                        #   audit_log, machine_decisions, human_resolutions, detection_windows
 │   ├── config.py            # env + constants (TOLERANCE, TDS_RATE, FN_COST…)
@@ -544,11 +570,15 @@ ledger-sentinel/
 ├── dashboard/
 │   └── app.py               # Pro dashboard + defense panel
 ├── data/
+│   ├── demo_story_orders.csv # 10-order beautiful demo
+│   ├── demo_story_settlement.csv
 │   └── generate_synthetic_data.py  # 60 orders, 179 events, 59 settlements + planted edges
 ├── tests/
 │   ├── test_reconcile.py    # 8
 │   ├── test_webhook.py      # 12
-│   └── test_defense.py      # 10 — cost, policy, chargeback, honest metrics
+│   ├── test_defense.py      # 10 — cost, policy, chargeback, honest metrics
+│   ├── test_batched.py      # 4 — batched UTR, demo story
+│   └── test_investigator.py # 8 — investigator, clustering, analyst, learning
 ├── docs/
 │   ├── dev-log.md           # real 0% match bug, root cause, audit-log proof
 │   ├── demo.gif             # demo walkthrough (see Architecture)

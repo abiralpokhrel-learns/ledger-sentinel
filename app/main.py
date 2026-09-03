@@ -326,6 +326,153 @@ def run_pipeline(conn, data_dir: Path = DATA_DIR, fresh: bool = True) -> dict:
     return summary
 
 
+
+# --- AI Financial Investigator (higher-value reasoning, defense-only) ---
+
+@app.get("/investigate/{order_id}")
+def investigate_order(order_id: str):
+    """Root-cause investigation with evidence attribution. Read-only gather, AI reasons, policy decides."""
+    try:
+        from app.investigator import investigate
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        result = investigate(conn, order_id)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/investigate/{order_id}/report.pdf")
+def investigate_report_pdf(order_id: str):
+    """Investigation report PDF — business artifact, not chat."""
+    try:
+        from app.clustering_analyst import build_investigation_report, render_investigation_pdf
+        from app.config import db_path as _dbp
+        import app.db as _db
+        import tempfile, pathlib
+        from fastapi.responses import FileResponse
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        report = build_investigation_report(conn, order_id)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        tmp = tempfile.mktemp(suffix=f"_investigate_{order_id}.pdf")
+        render_investigation_pdf(report, tmp)
+        return FileResponse(tmp, media_type="application/pdf", filename=f"investigation_{order_id}.pdf")
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/investigate/anomaly/spike")
+def investigate_spike(window: str = "1h", z: float = 2.0):
+    """Anomaly investigation — spike window -> evidence -> risk."""
+    try:
+        from app.investigator import investigate_anomaly
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        result = investigate_anomaly(conn, window=window, spike_threshold_z=z)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/clusters")
+def get_clusters(k: int = 3):
+    """Behavioral transaction clusters — segments for per-cluster thresholds."""
+    try:
+        from app.clustering_analyst import cluster_transactions
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        result = cluster_transactions(conn, k=k)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyst/query")
+def analyst_query(payload: dict):
+    """NL -> read-only SQL -> result -> explanation. Never writes."""
+    try:
+        from app.clustering_analyst import analyst_query as _aq
+        from app.config import db_path as _dbp
+        import app.db as _db
+        question = (payload or {}).get("question") or (payload or {}).get("q") or ""
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        result = _aq(conn, question)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/learning/metrics")
+def learning_metrics():
+    """Closed-loop: machine vs human agreement, confusion, dataset size."""
+    try:
+        from app.learning import evaluation_metrics
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        result = evaluation_metrics(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/learning/dataset")
+def learning_dataset():
+    """Export paired machine/human dataset for prompt improvement."""
+    try:
+        from app.learning import export_evaluation_dataset
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        result = export_evaluation_dataset(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return {"count": len(result), "dataset": result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

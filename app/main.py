@@ -244,6 +244,117 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/stats")
+def stats():
+    """Lightweight stats for dashboard / health checks."""
+    try:
+        conn = db.get_connection(db_path())
+        db.init_db(conn)
+        audit = db.load_audit_df(conn)
+        conn.close()
+        recon = audit[audit["outcome"].isin(["matched", "exception"])] if not audit.empty and "outcome" in audit.columns else audit
+        matched = int((recon["outcome"] == "matched").sum()) if not recon.empty else 0
+        exceptions = int((recon["outcome"] == "exception").sum()) if not recon.empty else 0
+        total = matched + exceptions
+        rate = round(matched / total * 100, 1) if total else 0.0
+        return {"total_rows": total, "matched": matched, "exceptions": exceptions, "match_rate_pct": rate, "audit_rows": len(audit)}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+@app.post("/ask")
+def ask_endpoint(payload: dict):
+    """AI Finance Assistant — ask questions about the audit log."""
+    q = (payload or {}).get("question", "") or (payload or {}).get("q", "")
+    try:
+        from app.assistant import ask as ledger_ask
+        conn = db.get_connection(db_path())
+        db.init_db(conn)
+        audit = db.load_audit_df(conn)
+        conn.close()
+        result = ledger_ask(q, audit)
+        return result
+    except Exception as e:
+        log.warning("ask failed: %s", e)
+        return {"answer": f"Assistant unavailable: {e}", "source": "error"}
+
+
+@app.get("/export.csv")
+def export_csv(outcome: str | None = None):
+    """Download audit_log as CSV. ?outcome=exception for exceptions only."""
+    from fastapi.responses import Response
+    conn = db.get_connection(db_path())
+    db.init_db(conn)
+    audit = db.load_audit_df(conn)
+    conn.close()
+    if outcome and not audit.empty and "outcome" in audit.columns:
+        audit = audit[audit["outcome"] == outcome]
+    csv_bytes = audit.to_csv(index=False).encode("utf-8") if not audit.empty else b""
+    return Response(content=csv_bytes, media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=audit_{outcome or 'all'}.csv"})
+
+
+@app.get("/report.pdf")
+def report_pdf():
+    """Download professional PDF audit report."""
+    from fastapi.responses import Response
+    try:
+        from app.report import build_pdf
+        conn = db.get_connection(db_path())
+        db.init_db(conn)
+        audit = db.load_audit_df(conn)
+        conn.close()
+        # Build summary
+        recon = audit[audit["outcome"].isin(["matched", "exception"])] if not audit.empty and "outcome" in audit.columns else audit
+        matched = int((recon["outcome"] == "matched").sum()) if not recon.empty else 0
+        exceptions = int((recon["outcome"] == "exception").sum()) if not recon.empty else 0
+        total = matched + exceptions
+        rate = round(matched / total * 100, 1) if total else 0.0
+        by_reason = recon["reason"].value_counts().to_dict() if not recon.empty and "reason" in recon.columns else {}
+        summary = {"total_rows": total, "matched": matched, "exceptions": exceptions, "match_rate_pct": rate, "by_reason": by_reason}
+        pdf_bytes = build_pdf(audit, summary)
+        return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=Ledger_Sentinel_Audit_Report.pdf"})
+    except Exception as e:
+        log.exception("report.pdf failed")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/reconcile-upload")
+async def reconcile_upload(request: __import__("fastapi").Request):
+    """Upload orders.csv + settlement.csv and reconcile live. Returns summary + exceptions."""
+    import io
+    import pandas as pd
+    from fastapi import HTTPException
+    try:
+        form = await request.form()
+        orders_file = form.get("orders")
+        settlement_file = form.get("settlement")
+        if not orders_file or not settlement_file:
+            raise HTTPException(status_code=400, detail="Send multipart form with 'orders' and 'settlement' CSV files")
+        # Read CSVs
+        orders_bytes = await orders_file.read()  # type: ignore
+        settlement_bytes = await settlement_file.read()  # type: ignore
+        orders_df = pd.read_csv(io.BytesIO(orders_bytes))
+        settlement_df = pd.read_csv(io.BytesIO(settlement_bytes))
+        matched, exceptions = reconcile.reconcile(orders_df, settlement_df)
+        summary = reconcile.summarize(matched, exceptions)
+        # classify top exceptions for preview
+        from app.classify import classify_exception
+        preview = []
+        for _, r in exceptions.head(10).iterrows():
+            row = {k: (v if not pd.isna(v) else None) for k, v in r.to_dict().items()}
+            try:
+                c = classify_exception(row)
+            except Exception:
+                c = {"classification": "unresolved", "audit_note": ""}
+            preview.append({"order_id": str(r.get("order_id")), "reason": str(r.get("reason")), **c, "diff": float(r.get("diff")) if pd.notna(r.get("diff")) else None})
+        return {"summary": summary, "preview": preview, "matched_count": len(matched), "exceptions_count": len(exceptions)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"reconcile failed: {e}")
+
+
 @app.post("/run-pipeline")
 def run_pipeline_endpoint(fresh: bool = True):
     conn = db.get_connection(db_path())

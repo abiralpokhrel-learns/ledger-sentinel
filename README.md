@@ -1,200 +1,233 @@
 # Ledger Sentinel
 
-> **Razorpay AI Buildathon 2026 · Track 04: AI Finance Controller**
-> An agent that reconciles a batch of Razorpay orders, webhook events, and a
-> settlement file — matching what's owed against what actually got paid out, and
-> routing anything that doesn't cleanly match to an LLM for classification
-> instead of a human.
+> Your finance assistant that checks if the money you expected matches the money you actually received.
+
+Built for **Razorpay AI Buildathon 2026 — Track 04: AI Finance Controller**
 
 ---
 
-## 1. Problem statement
+## The problem, in plain English
 
-A mid-size merchant on Razorpay processes thousands of orders a month. At
-month-end, finance ops must reconcile **what Razorpay settled** against **what
-the order ledger says was owed**, order by order. Done by hand — pulling two
-CSV exports into a spreadsheet and eyeballing the differences — this routinely
-lands around a **51% match rate** on the first pass: the rest are rounding
-noise, TDS/TCS withholdings, late captures, and genuinely unexplained gaps that
-each take a human 2–5 minutes to triage.
+Imagine you run a shop on Razorpay. Every month you have two lists:
 
-At scale that is real money stuck in limbo and real payroll burned on
-mechanical matching. Structured tooling that does exact, tolerance-based
-matching pushes the clean match rate to **88%+**, leaving only the ambiguous
-few for human (or AI) judgment. **Ledger Sentinel** is that tooling: it closes
-the reconciliation loop across a batch, reports its match rate honestly, and
-isolates every unresolved item with a plain-English reason instead of a silent
-failure.
+1. **What you sold** — your order records (amount, fees, taxes)
+2. **What Razorpay paid you** — the settlement report
 
-## 2. What it does
+At the end of the month, someone in finance sits with two spreadsheets and tries to match every single row by hand. It is slow, boring, and error-prone. On the first pass only about **half** the rows match cleanly. The rest need a human to figure out: was it a tax deduction? A late payment? Or a real problem?
 
-1. Ingests a Razorpay **webhook event stream** (FastAPI), verifying each
-   delivery with HMAC-SHA256 before anything else.
-2. Applies a **deterministic state machine** with idempotency so duplicate and
-   out-of-order deliveries are handled without manual intervention.
-3. Loads the **settlement file** and reconciles it against orders with a
-   money tolerance (never strict `==` on floats).
-4. Routes only the **surviving exceptions** to an LLM (Anthropic) for
-   classification and a human-readable audit note.
-5. Writes **every row** — matched or exception — to an `audit_log`.
-6. Shows the **match rate + exception table** on a one-screen Streamlit dashboard.
+Ledger Sentinel does that matching automatically.
 
-## 3. Architecture
+---
+
+## What it does
+
+Think of it as 3 steps:
+
+**1. Listens for payments**
+When Razorpay sends a payment update (like "order created" or "payment captured"), Ledger Sentinel checks that it is genuine and records it. If the same message arrives twice, it ignores the duplicate. If messages arrive out of order, it handles that too.
+
+**2. Matches the money**
+It compares what you *should* have received (order amount minus fees and taxes) against what *actually* arrived in your bank. Small rounding differences (less than 1 paisa) are treated as okay. Everything that matches is marked done.
+
+**3. Explains the rest**
+Only the rows that *don't* match go to AI. The AI writes a one-line explanation in plain English, like:
+- "This shortfall looks like a TDS tax deduction — expected."
+- "Payment shows as failed in your records but arrived in settlement — likely a late confirmation."
+- "Large unexplained gap — needs a human to check."
+
+Every single row, matched or not, is saved in an audit log so nothing is hidden.
+
+---
+
+## See it work
+
+Run it on the included demo data (60 fake orders with real-world edge cases):
 
 ```
-                 ┌─────────────────────┐
-Razorpay         │   Webhook Handler    │
-test-mode  ──────▶  (FastAPI)           │
-events            │  1. verify HMAC      │
-                  │  2. check idempotent │
-                  │  3. validate state   │
-                  │     transition       │
-                  └──────────┬───────────┘
-                             │
-                             ▼
-                  ┌──────────────────────┐
-                  │   SQLite             │
-                  │   orders / events /   │
-                  │   audit_log           │
-                  └──────────┬───────────┘
-                             │
-                             ▼
-                  ┌──────────────────────┐
-Settlement  ─────▶│  Reconciliation      │
-file (CSV)        │  Engine (Pandas)     │
-                  │  tolerance-matched   │
-                  └──────────┬───────────┘
-                            │
-              clean match ──┤── exception
-                            │        │
-                            ▼        ▼
-                    audit_log   ┌──────────────┐
-                                │  AI Classifier │
-                                │  (Anthropic)   │
-                                │  → audit note  │
-                                └──────┬─────────┘
-                                       ▼
-                                  audit_log
-                                       │
-                                       ▼
-                            ┌────────────────────┐
-                            │  Streamlit Dashboard│
-                            │  match rate +       │
-                            │  exception table    │
-                            └────────────────────┘
+Total rows reconciled : 61
+Matched               : 49
+Exceptions            : 12
+Match rate            : 80.3%
 ```
 
-## 4. Why AI, why not
+The 12 exceptions are exactly the tricky cases we planted:
 
-This split is the core design decision and the part the panel will probe.
+| What happened | How many | AI calls it |
+|---|---|---|
+| Tax (TDS) deduction | 3 | expected_tds_withholding |
+| Late payment confirmation | 3 | late_authorization_flip |
+| Large unexplained gap | 2 | unresolved |
+| Failed orders with no payout | 3 | unresolved |
+| Settlement with no matching order | 1 | unresolved |
 
-**Deterministic (no AI — exact, auditable, replayable):**
-- **Signature verification** — HMAC over raw request bytes. Cryptography, not judgment.
-- **Idempotency** — `event_id` is a primary key; a duplicate delivery is acknowledged and skipped.
-- **State machine** — forward-only transitions on `{created, authorized, captured, refunded, failed}`. Backward deliveries are dropped and logged.
-- **Tolerance matching** — net payout (`amount − MDR − GST`) vs settled amount within ₹0.01. Money is never compared with `==`.
+Rows with tiny rounding noise (within Rs 0.01) were correctly matched — where a strict `==` check would have failed.
 
-**AI (genuine judgment, only on the residue):**
-- The **exceptions that survive deterministic matching** — TDS/TCS-shaped gaps, late-authorization flips, and unexplained differences — are sent to Claude for a single classification and a one-sentence audit note. The full batch is never sent; only isolated exception rows, so the model stays focused and fast.
+The **dashboard** shows all of this on one screen: match rate at the top, exception table with AI notes below.
 
-The principle: *AI has no business deciding what is exact. It earns its place only where a human would otherwise have to make a judgment call.*
+![Demo](docs/demo.gif)
 
-## 5. Setup
+![Architecture](docs/architecture.png)
 
-Prerequisites: Python 3.11+, and (optionally) Node.js + `npx` and Docker if you
-want the live Razorpay MCP path instead of the synthetic data.
+---
+
+## What's new in Pro — built to stand out at the hackathon
+
+| Feature | Why judges love it |
+|---|---|
+| **Pro Dashboard** — KPI cards, bar chart by reason, match gauge, priority inbox (largest gaps) | Instantly readable, looks like a real finance product |
+| **AI Finance Assistant** — chat with your ledger: “Why is order_0010 flagged?” | Wow factor + shows AI is *useful*, not just decorative |
+| **Bring Your Own CSV** — upload your own orders + settlement and reconcile live | Interactive demo — judges can test with their data |
+| **One-click PDF Audit Report** — professional report with KPIs, exception table & sign-off line | Deliverable they can hold — `GET /report.pdf` |
+| **Filters & Search** — filter by reason/classification, search any order | Feels like a real tool, not a toy |
+| **Live Webhook Feed** — last 10 deliveries on the dashboard | Proves the webhook pipeline is real |
+
+New API for these: `GET /stats` · `POST /ask` · `GET /export.csv` · `GET /report.pdf` · `POST /reconcile-upload`
+
+---
+
+## Who is it for?
+
+- **Finance / Ops teams** — no more spreadsheet wrestling at month-end
+- **Founders** — know instantly how much is settled vs stuck
+- **Developers** — clean, auditable pipeline you can plug real Razorpay data into
+
+No finance expertise needed to read the dashboard. Green = matched, orange = needs attention, and every orange row has a plain-English reason.
+
+---
+
+## Try it in 3 steps
+
+You need Python 3.11 or newer.
 
 ```bash
-# 1. Clone and enter
+# 1. Install
+git clone <your-repo-url>
 cd ledger-sentinel
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Mac/Linux:
+# source .venv/bin/activate
 
-# 2. Create a venv and install
-python -m venv .venv && .venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 
-# 3. Configure environment
-cp .env.example .env
-#   - set WEBHOOK_SECRET (or leave the dev default to run the demo as-is)
-#   - set ANTHROPIC_API_KEY for real AI classification
-#     (without it, the classifier falls back to a deterministic heuristic)
-
-# 4. Generate the synthetic 50+ record batch (planted edge cases included)
+# 2. Run (works out of the box, no API keys needed)
 python data/generate_synthetic_data.py
-
-# 5. Run the full pipeline end to end
 python -m app.main
 
-# 6. (optional) Launch the dashboard in another terminal
+# 3. See the dashboard
 streamlit run dashboard/app.py
-
-# 7. (optional) Run the sanity tests
-python -m pytest tests/ -q
-
-# 8. (optional) Start the webhook server
-uvicorn app.main:app --reload
 ```
 
-> **Note on MCP:** `app/mcp_client.py` supports both the Remote
-> (`npx mcp-remote`) and Local Docker Razorpay MCP servers. Because the
-> buildathon uses synthetic data, the pipeline runs against `settlement.csv`;
-> the MCP client is the live-data alternative and degrades gracefully if no
-> test-mode credentials are present.
+That's it. The pipeline runs on fake demo data. No Razorpay account needed.
 
-## 6. Result on the synthetic batch
-
-Running the pipeline against the generated 61-row merged batch:
+**Want real AI explanations?** Add your Anthropic key to a `.env` file:
 
 ```
-  Total rows reconciled : 61
-  Matched               : 49
-  Exceptions            : 12
-  Match rate            : 80.3%
+cp .env.example .env
+# then edit .env and set ANTHROPIC_API_KEY
 ```
 
-The 12 exceptions break down exactly as the planted edge cases intended:
+Without the key it still works — it just uses a simple rule-based fallback instead of Claude.
 
-| Reason | Count | Routed to AI as |
-|---|---|---|
-| `exception_tds_candidate` (TDS/TCS-shaped gap) | 3 | `expected_tds_withholding` |
-| `status_mismatch` (late-auth flips / missed captures) | 3 | `late_authorization_flip` |
-| `exception_unexplained` (large random gap) | 2 | `unresolved` |
-| `missing_settlement` (failed orders, no payout) | 3 | `unresolved` |
-| `missing_order` (settlement with no order) | 1 | `unresolved` |
+**Want live Razorpay data?** Set your test-mode keys in `.env` and the MCP client (`app/mcp_client.py`) can pull real settlements. If keys are missing it gracefully falls back to the demo file.
 
-The 3 "rounding-level" rows (within ₹0.01) were correctly auto-reconciled,
-proving the tolerance band works where strict equality would have failed.
+---
 
-## 7. Developer log (real failure, Day 7-style)
+## How it works (the simple version)
 
-A genuine bug surfaced while wiring the webhook state machine to the database —
-documented live in `docs/dev-log.md`. Short version: two defects in the order
-persistence layer (a swapped parameter in `UPDATE orders SET status = ?` and the
-first event overwriting the order's real amount with `0.0`) left every order
-stuck at `created` and produced a **0% match rate**. Both were caught because
-the audit_log showed the impossible result, traced to `try_record_event`, and
-fixed. The lesson — the audit trail is what makes a wrong answer *visible* —
-is exactly why the design logs every row.
+```
+Razorpay sends payment update
+        |
+        v
+  [ Check: is it real? is it duplicate? is it in order? ]  <- no AI, just exact rules
+        |
+        v
+  Compare "what you should get" vs "what you got"           <- still no AI, just math
+        |
+   +----+----+
+   |         |
+matched   exception  ---->  AI writes one-line explanation  <- AI only here
+   |         |
+   v         v
+      Audit log  ---->  Dashboard (match rate + table)
+```
 
-## 8. Repository layout
+**The key idea:** AI is only used where a human would otherwise have to make a judgment call. Everything that can be checked with certainty is checked with certainty.
 
+---
+
+## For developers
+
+<details>
+<summary>Click to expand technical details</summary>
+
+**Stack:** FastAPI (webhooks) + SQLite (WAL) + Pandas (reconciliation) + Anthropic Claude (exceptions only) + Streamlit (dashboard)
+
+**Project structure:**
 ```
 ledger-sentinel/
-├── requirements.txt
-├── .env.example
-├── data/
-│   └── generate_synthetic_data.py
 ├── app/
-│   ├── main.py          # FastAPI entrypoint + end-to-end pipeline
-│   ├── webhook.py       # signature / idempotency / state machine
-│   ├── reconcile.py     # Pandas tolerance matching
-│   ├── classify.py      # AI exception classification (+ heuristic fallback)
-│   ├── db.py            # SQLite schema + helpers
-│   ├── config.py        # shared constants / secrets
-│   └── mcp_client.py    # Razorpay MCP integration (Remote/Local)
-├── dashboard/
-│   └── app.py           # Streamlit dashboard
+│   ├── main.py          # FastAPI app + pipeline + new APIs (/ask, /report.pdf, /reconcile-upload)
+│   ├── webhook.py       # HMAC-SHA256 verify, idempotency, forward-only state machine
+│   ├── reconcile.py     # tolerance matching (Rs 0.01), status consistency
+│   ├── classify.py      # AI classification + heuristic fallback
+│   ├── assistant.py     # AI Finance Assistant (chat with ledger)
+│   ├── report.py        # professional PDF audit report (fpdf2)
+│   ├── db.py            # SQLite schema (orders, webhook_events, settlement, audit_log)
+│   ├── config.py        # env / constants (TOLERANCE, TDS_RATE 2% +-0.5pp)
+│   └── mcp_client.py    # Razorpay MCP (remote via npx / local via docker)
+├── dashboard/app.py     # Pro dashboard (KPI cards, charts, chat, upload, PDF export)
+├── data/generate_synthetic_data.py
 ├── tests/
-│   └── test_reconcile.py
-└── docs/
-    └── dev-log.md
+└── docs/dev-log.md
 ```
+
+**API:**
+- `POST /webhook` — Razorpay webhook ingestion (requires `x-razorpay-signature`)
+- `GET /health` — health check
+- `GET /stats` — KPI summary (total/matched/exceptions/rate)
+- `POST /ask` — AI Finance Assistant (`{"question": "..."}`)
+- `GET /export.csv?outcome=exception` — download audit as CSV
+- `GET /report.pdf` — download professional PDF audit report
+- `POST /reconcile-upload` — upload orders.csv + settlement.csv (multipart) for live reconcile
+- `POST /run-pipeline?fresh=true` — trigger full pipeline via HTTP
+
+**Environment variables** (see `.env.example`):
+- `WEBHOOK_SECRET` — HMAC secret (defaults to dev value for demo)
+- `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` — for AI classification
+- `LEDGER_DB_PATH` — SQLite path (default `ledger_sentinel.db`)
+- `LEDGER_TOLERANCE` — override matching tolerance
+- `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` / `RAZORPAY_MERCHANT_TOKEN` / `RAZORPAY_MCP_URL` / `LEDGER_MCP_MODE` — live MCP
+
+**Tests & checks:**
+```bash
+python -m pytest tests/ -q                          # 20 tests
+python scripts/live_webhook_check.py                # real HTTP webhook gates
+python scripts/dashboard_smoke_check.py             # dashboard + data path
+python -m app.main --clear-only                     # wipe DB without deleting file (Windows-safe)
+```
+
+**Design principle:** deterministic first, AI last. Signature / idempotency / state machine / tolerance matching are all auditable and replayable. AI never decides what is exact.
+
+</details>
+
+---
+
+## What makes it trustworthy?
+
+- **Nothing is silently ignored.** Every row gets an audit entry, even duplicates and bad signatures.
+- **Re-runs are safe.** Run the pipeline twice and you get the same result — no duplicates.
+- **Windows-friendly.** No need to delete the database file by hand (which often fails because the app still has it open).
+- **Fails gracefully.** Missing API keys, bad CSV rows, or a locked database don't crash the whole run — they are logged and skipped.
+
+---
+
+## Docs
+
+- `docs/dev-log.md` — real bug we hit (0% match rate) and how the audit log helped us find it
+- `docs/architecture.png` — diagram above (generate with `python scripts/generate_architecture.py`)
+
+---
+
+*Built with care for the Razorpay AI Buildathon. The goal is not to replace finance teams, but to give them a head start — 80% auto-matched, and a clear explanation for the rest.*

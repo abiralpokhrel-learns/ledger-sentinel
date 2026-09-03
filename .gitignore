@@ -16,3 +16,5 @@ ledger_sentinel.db
 # OS cruft
 .DS_Store
 Thumbs.db
+audit_report.pdf
+/demo.gif

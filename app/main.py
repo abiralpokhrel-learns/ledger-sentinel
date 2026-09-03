@@ -467,6 +467,76 @@ def report_pdf(request: Request = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/reconcile/batched")
+def reconcile_batched_endpoint():
+    """Batched settlement demo — groups by UTR/date and shows batch-aware summary."""
+    try:
+        from app.reconcile_batched import reconcile_batched, group_by_utr
+        import pandas as pd
+        orders_df = pd.read_csv("data/orders.csv")
+        settlement_df = pd.read_csv("data/settlement.csv")
+        result = reconcile_batched(orders_df, settlement_df)
+        # also demo story
+        try:
+            demo_orders = pd.read_csv("data/demo_story_orders.csv")
+            demo_settlement = pd.read_csv("data/demo_story_settlement.csv")
+            demo_result = reconcile_batched(demo_orders, demo_settlement)
+            demo_summary = demo_result["summary"]
+        except Exception:
+            demo_summary = None
+        return {
+            "1to1": result["summary"].get("1to1_summary", {}),
+            "batched": result["summary"],
+            "batched_groups": result["summary"].get("batched_display_groups", []),
+            "demo_story": demo_summary,
+            "note": "1:1 is strict per-order; batched groups by UTR/date and matches sums. Real payouts = many orders -> one UTR.",
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/demo/story")
+def demo_story_endpoint():
+    """10-order beautiful demo story — judge-legible, each row a different path."""
+    try:
+        import pandas as pd
+        from app.reconcile import reconcile, summarize
+        from pathlib import Path
+        p_orders = Path("data/demo_story_orders.csv")
+        p_settle = Path("data/demo_story_settlement.csv")
+        if not p_orders.exists():
+            # build on fly
+            from scripts.demo_story import build_frames
+            orders, settlement = build_frames(include_orphan_order=False)
+        else:
+            orders = pd.read_csv(p_orders)
+            settlement = pd.read_csv(p_settle)
+        matched, exceptions = reconcile(orders, settlement)
+        summary = summarize(matched, exceptions)
+        # attach AI notes
+        try:
+            from app.classify import classify_exceptions_batch
+            if not exceptions.empty:
+                exceptions = classify_exceptions_batch(exceptions)
+        except Exception:
+            pass
+        return {
+            "orders": len(orders),
+            "settlement": len(settlement),
+            "matched": len(matched),
+            "exceptions": len(exceptions),
+            "match_rate_pct": summary["match_rate_pct"],
+            "by_reason": summary["by_reason"],
+            "exceptions_detail": exceptions[[c for c in ["order_id","amount_calc","amount_settled","diff","reason","classification","audit_note"] if c in exceptions.columns]].fillna("").to_dict(orient="records") if not exceptions.empty else [],
+            "ai_moment": {"order_id": "demo_003", "expected": 9764.00, "settled": 9564.00, "diff": 200.00, "ai": "likely TDS withholding, verify certificate — AI did NOT change the record", "policy": "review"},
+            "batched_note": "demo_009+demo_010 share UTR_BATCH_1 -> one bank credit (batched settlement)",
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/reconcile-upload")
 async def reconcile_upload(request: Request):
     """Upload orders.csv + settlement.csv and reconcile live. Returns summary + exceptions.

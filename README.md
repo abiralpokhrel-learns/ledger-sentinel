@@ -393,6 +393,8 @@ streamlit run dashboard/app.py   # → http://localhost:8501
 | `GET` | `/export.csv?outcome=exception` | Download audit CSV | Filtered |
 | `GET` | `/report.pdf` | Professional PDF audit report | Cover + KPIs + exception table |
 | `POST` | `/reconcile-upload` | Upload `orders` + `settlement` CSVs (multipart, 5 MB + 10k row caps) | Amount-only, labeled delta |
+| `GET` | `/reconcile/batched` | Batched settlement view (UTR/date groups) | Shows batch-aware summary + `batched_groups` |
+| `GET` | `/demo/story` | 10-order beautiful story (judge-legible) | Each row a different path + AI moment + batched note |
 | `POST` | `/run-pipeline?fresh=true` | Trigger full pipeline via HTTP | — |
 | `POST` | `/detect` | Cost-sensitive detection on `transactions[]` | Signal-only |
 | `GET` | `/detect/demo` | Synthetic detection demo | Held-out |
@@ -580,7 +582,7 @@ We disclose simplifications so judges can evaluate credibility:
 
 - **Synthetic data.** The 80.3% is on Faker data with planted edges. The upload path (BYO CSV) lets you test on *your* data — "it survived data we didn't design" is the stronger claim.
 - **TDS band.** Flat 2% ±0.5pp, category-aware via `tds_rate_for()` but still flat per category — not real TDS/TCS law (thresholds, certificates, sections). Labeled `exception_tds_candidate` → `expected_tds_withholding` as *candidate*, not certainty.
-- **Matching model.** 1:1 outer join. Real Razorpay settlements are often **batched** (many orders in one UTR/bank credit) — the most likely question from a Razorpay engineer on the panel. Next is an aggregation layer (group by UTR/date, then match sums).
+- **Matching model.** 1:1 outer join. Real Razorpay settlements are often **batched** (many orders in one UTR/bank credit) — the most likely question from a Razorpay engineer on the panel. **Now shipped:** `app/reconcile_batched.py` groups by UTR/date (`group_by_utr`) and reconciles sums with the same tolerance; see `GET /reconcile/batched` and the dashboard's batched insight. The 1:1 path remains the MVP default for audit clarity.
 - **Scale.** SQLite + full-dataframe Pandas is correct for demo (60 → 10k rows fine). For production: Postgres + incremental reconciliation + `classify_exceptions_batch` with hash cache + ThreadPool (already ships; `LEDGER_NO_CACHE=1` to force fresh).
 - **Scoring model.** `app/detection.py` and `app/metrics.py` use synthetic scores to demo cost-sensitive thresholding and windowing. Plugging a real XGBoost/IsolationForest scorer is a one-line `scores = model.predict_proba(X)[:,1]` before `find_optimal_threshold` — the cost, window, and spike logic is model-agnostic.
 
@@ -590,6 +592,7 @@ We disclose simplifications so judges can evaluate credibility:
 
 - `docs/dev-log.md` — real bug (0% match) and how audit_log found it
 - `docs/demo.gif` — hero visual (pipeline + dashboard walkthrough) — regenerate: `python scripts/generate_demo_gif.py`
+- `scripts/demo_story.py` — 10-order beautiful demo (run `PYTHONPATH=. python scripts/demo_story.py`)
 - `data/generate_synthetic_data.py` — deterministic Faker plan (documented planted inventory)
 
 **`Failed to fetch: https://github.com/.../blob/main/app/webhook.py` or `/tree/main/app`** — those URLs are GitHub **HTML pages**, not raw files. Browsers block `fetch()` on them (CORS/CSP). Use one of these instead:

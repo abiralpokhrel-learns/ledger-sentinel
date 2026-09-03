@@ -63,7 +63,7 @@ def reconcile(orders_df: pd.DataFrame, settlement_df: pd.DataFrame):
     # Amount difference where both sides exist; NaN where a side is missing.
     merged["diff"] = (
         merged["amount_calc"] - merged["amount_settled"]
-    ).abs()
+    ).abs().round(2)
 
     # Status consistency: if both sides exist, do they agree on money moving?
     def status_consistent(row) -> bool:

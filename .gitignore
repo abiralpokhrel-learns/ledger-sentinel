@@ -18,3 +18,5 @@ ledger_sentinel.db
 Thumbs.db
 audit_report.pdf
 /demo.gif
+.classify_cache.json
+.classify_cache.json.tmp

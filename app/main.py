@@ -16,13 +16,14 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
 from fastapi import FastAPI
 
 from app import db, reconcile, webhook
-from app.classify import classify_exception
+from app.classify import classify_exception, classify_exceptions_batch
 from app.config import db_path, webhook_secret
 from app.webhook import try_record_event, verify_signature
 
@@ -152,6 +153,81 @@ def _process_webhook_events(conn, data_dir: Path, secret: str):
 
 
 def _load_settlement(conn, data_dir: Path):
+    # 1) Try live Razorpay MCP first — this is the real-data path.
+    # If credentials/server unavailable, fall back to synthetic CSV gracefully.
+    # This is the differentiator: setting RAZORPAY_* in .env actually does something now.
+    mcp_rows = None
+    use_mcp = os.getenv("LEDGER_USE_MCP", "auto").lower()  # auto | force | off
+    if use_mcp != "off":
+        has_creds = bool(os.getenv("RAZORPAY_KEY_ID") or os.getenv("RAZORPAY_MERCHANT_TOKEN"))
+        if use_mcp == "force" or has_creds or use_mcp == "auto":
+            try:
+                from app.mcp_client import fetch_settlements_sync
+                log.info("Trying live Razorpay MCP for settlements (mode=%s)...", os.getenv("LEDGER_MCP_MODE", "remote"))
+                mcp_data = fetch_settlements_sync()
+                # Normalize MCP response shapes:
+                # - {"settlements": [...]} or {"data": [...]} or direct list
+                raw_list = None
+                if isinstance(mcp_data, list):
+                    raw_list = mcp_data
+                elif isinstance(mcp_data, dict):
+                    # ignore empty fallback {}
+                    if mcp_data:
+                        raw_list = mcp_data.get("settlements") or mcp_data.get("data") or mcp_data.get("items")
+                        if raw_list is None and "order_id" in mcp_data:
+                            raw_list = [mcp_data]
+                if raw_list:
+                    mcp_rows = []
+                    for item in raw_list:
+                        if not isinstance(item, dict):
+                            continue
+                        try:
+                            # Accept multiple field naming conventions from MCP
+                            oid = str(item.get("order_id") or item.get("orderId") or item.get("id") or "")
+                            if not oid:
+                                continue
+                            amt = float(item.get("amount_settled") or item.get("amount") or item.get("settled_amount") or 0)
+                            mcp_rows.append((
+                                oid, amt,
+                                str(item.get("settlement_status") or item.get("status") or "captured"),
+                                str(item.get("utr") or item.get("utr_number") or ""),
+                                str(item.get("settlement_date") or item.get("date") or ""),
+                            ))
+                        except Exception as e:
+                            log.warning("skipping MCP settlement row %s: %s", item, e)
+                            continue
+                    if mcp_rows:
+                        log.info("MCP returned %d settlements — using live data", len(mcp_rows))
+                    else:
+                        log.info("MCP returned no usable rows, falling back to CSV")
+                        mcp_rows = None
+                else:
+                    if mcp_data:
+                        log.info("MCP returned unexpected shape %s, falling back to CSV", type(mcp_data))
+            except Exception as e:
+                log.info("MCP settlement fetch failed (%s) — falling back to CSV", e)
+                mcp_rows = None
+
+    if mcp_rows is not None:
+        s_rows = mcp_rows
+        # Insert MCP rows directly
+        try:
+            conn.executemany(
+                """INSERT INTO settlement (order_id, amount_settled, settlement_status, utr, settlement_date)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                     amount_settled=excluded.amount_settled,
+                     settlement_status=excluded.settlement_status,
+                     utr=excluded.utr,
+                     settlement_date=excluded.settlement_date""",
+                s_rows,
+            )
+            log.info("Loaded %d settlements from MCP", len(s_rows))
+            return
+        except Exception as e:
+            log.warning("MCP settlement insert failed (%s), falling back to CSV", e)
+
+    # 2) Fallback: synthetic CSV
     path = data_dir / "settlement.csv"
     if not path.exists():
         log.error("Missing %s", path)
@@ -217,17 +293,24 @@ def run_pipeline(conn, data_dir: Path = DATA_DIR, fresh: bool = True) -> dict:
                          "reconciled within tolerance")
         except Exception as e:
             log.warning("log matched %s failed: %s", r.get("order_id"), e)
-    # Audit every exception, routing to the AI classifier.
+    # Audit every exception, routing to the AI classifier (batched + cached for scale).
+    exc_rows = []
     for _, r in exceptions.iterrows():
-        row = {k: (v if not pd.isna(v) else None) for k, v in r.to_dict().items()}
-        try:
-            result = classify_exception(row)
-        except Exception as e:
-            log.warning("classify %s failed: %s", row.get("order_id"), e)
-            result = {"classification": "unresolved", "audit_note": f"classify failed: {e}"}
+        exc_rows.append({k: (v if not pd.isna(v) else None) for k, v in r.to_dict().items()})
+    try:
+        results = classify_exceptions_batch(exc_rows, max_workers=5)
+    except Exception as e:
+        log.warning("batch classify failed: %s, falling back to sequential", e)
+        results = []
+        for row in exc_rows:
+            try:
+                results.append(classify_exception(row))
+            except Exception as e2:
+                results.append({"classification": "unresolved", "audit_note": f"classify failed: {e2}"})
+    for row, result in zip(exc_rows, results):
         try:
             db.log_audit(
-                conn, str(r["order_id"]), "exception",
+                conn, str(row.get("order_id")), "exception",
                 reason=str(row.get("reason", "exception")),
                 classification=str(result.get("classification", "unresolved")),
                 audit_note=str(result.get("audit_note", "")),
@@ -245,13 +328,29 @@ def health():
 
 
 @app.get("/stats")
-def stats():
+def stats(request: __import__("fastapi").Request = None):  # type: ignore
     """Lightweight stats for dashboard / health checks."""
     try:
-        conn = db.get_connection(db_path())
-        db.init_db(conn)
-        audit = db.load_audit_df(conn)
-        conn.close()
+        # Reuse the lifespan DB handle when available (like /webhook does)
+        conn = None
+        if request is not None:
+            try:
+                conn = getattr(request.app.state, "db", None)
+            except Exception:
+                conn = None
+        close_after = False
+        if conn is None:
+            conn = db.get_connection(db_path())
+            db.init_db(conn)
+            close_after = True
+        try:
+            audit = db.load_audit_df(conn)
+        finally:
+            if close_after:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         recon = audit[audit["outcome"].isin(["matched", "exception"])] if not audit.empty and "outcome" in audit.columns else audit
         matched = int((recon["outcome"] == "matched").sum()) if not recon.empty else 0
         exceptions = int((recon["outcome"] == "exception").sum()) if not recon.empty else 0
@@ -263,15 +362,30 @@ def stats():
 
 
 @app.post("/ask")
-def ask_endpoint(payload: dict):
+def ask_endpoint(payload: dict, request: __import__("fastapi").Request = None):  # type: ignore
     """AI Finance Assistant — ask questions about the audit log."""
     q = (payload or {}).get("question", "") or (payload or {}).get("q", "")
     try:
         from app.assistant import ask as ledger_ask
-        conn = db.get_connection(db_path())
-        db.init_db(conn)
-        audit = db.load_audit_df(conn)
-        conn.close()
+        conn = None
+        if request is not None:
+            try:
+                conn = getattr(request.app.state, "db", None)
+            except Exception:
+                conn = None
+        close_after = False
+        if conn is None:
+            conn = db.get_connection(db_path())
+            db.init_db(conn)
+            close_after = True
+        try:
+            audit = db.load_audit_df(conn)
+        finally:
+            if close_after:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         result = ledger_ask(q, audit)
         return result
     except Exception as e:
@@ -280,13 +394,28 @@ def ask_endpoint(payload: dict):
 
 
 @app.get("/export.csv")
-def export_csv(outcome: str | None = None):
+def export_csv(outcome: str | None = None, request: __import__("fastapi").Request = None):  # type: ignore
     """Download audit_log as CSV. ?outcome=exception for exceptions only."""
     from fastapi.responses import Response
-    conn = db.get_connection(db_path())
-    db.init_db(conn)
-    audit = db.load_audit_df(conn)
-    conn.close()
+    conn = None
+    if request is not None:
+        try:
+            conn = getattr(request.app.state, "db", None)
+        except Exception:
+            conn = None
+    close_after = False
+    if conn is None:
+        conn = db.get_connection(db_path())
+        db.init_db(conn)
+        close_after = True
+    try:
+        audit = db.load_audit_df(conn)
+    finally:
+        if close_after:
+            try:
+                conn.close()
+            except Exception:
+                pass
     if outcome and not audit.empty and "outcome" in audit.columns:
         audit = audit[audit["outcome"] == outcome]
     csv_bytes = audit.to_csv(index=False).encode("utf-8") if not audit.empty else b""
@@ -294,22 +423,37 @@ def export_csv(outcome: str | None = None):
 
 
 @app.get("/report.pdf")
-def report_pdf():
+def report_pdf(request: __import__("fastapi").Request = None):  # type: ignore
     """Download professional PDF audit report."""
     from fastapi.responses import Response
     try:
         from app.report import build_pdf
-        conn = db.get_connection(db_path())
-        db.init_db(conn)
-        audit = db.load_audit_df(conn)
-        conn.close()
+        conn = None
+        if request is not None:
+            try:
+                conn = getattr(request.app.state, "db", None)
+            except Exception:
+                conn = None
+        close_after = False
+        if conn is None:
+            conn = db.get_connection(db_path())
+            db.init_db(conn)
+            close_after = True
+        try:
+            audit = db.load_audit_df(conn)
+        finally:
+            if close_after:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         # Build summary
         recon = audit[audit["outcome"].isin(["matched", "exception"])] if not audit.empty and "outcome" in audit.columns else audit
         matched = int((recon["outcome"] == "matched").sum()) if not recon.empty else 0
         exceptions = int((recon["outcome"] == "exception").sum()) if not recon.empty else 0
         total = matched + exceptions
         rate = round(matched / total * 100, 1) if total else 0.0
-        by_reason = recon["reason"].value_counts().to_dict() if not recon.empty and "reason" in recon.columns else {}
+        by_reason = recon[recon["outcome"] == "exception"]["reason"].value_counts().to_dict() if not recon.empty and "reason" in recon.columns else {}
         summary = {"total_rows": total, "matched": matched, "exceptions": exceptions, "match_rate_pct": rate, "by_reason": by_reason}
         pdf_bytes = build_pdf(audit, summary)
         return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=Ledger_Sentinel_Audit_Report.pdf"})
@@ -321,21 +465,44 @@ def report_pdf():
 
 @app.post("/reconcile-upload")
 async def reconcile_upload(request: __import__("fastapi").Request):
-    """Upload orders.csv + settlement.csv and reconcile live. Returns summary + exceptions."""
+    """Upload orders.csv + settlement.csv and reconcile live. Returns summary + exceptions.
+
+    NOTE: This endpoint does amount-only reconciliation (tolerance + TDS band).
+    It intentionally ignores the `status` column if present, so it verifies
+    matching + AI explanation, not webhook state integrity. The full pipeline
+    (`python -m app.main` / POST /run-pipeline) replays the webhook stream and
+    will show ~80.3% on the synthetic data vs ~85.2% here — that delta is
+    the 3 status_mismatch cases caused by planted bad signatures.
+    """
     import io
     import pandas as pd
     from fastapi import HTTPException
+    MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB per file — reuse webhook body guard pattern
+    MAX_ROWS = 10000
     try:
         form = await request.form()
         orders_file = form.get("orders")
         settlement_file = form.get("settlement")
         if not orders_file or not settlement_file:
             raise HTTPException(status_code=400, detail="Send multipart form with 'orders' and 'settlement' CSV files")
-        # Read CSVs
+        # Read with size guard
         orders_bytes = await orders_file.read()  # type: ignore
         settlement_bytes = await settlement_file.read()  # type: ignore
+        if len(orders_bytes) > MAX_UPLOAD_BYTES or len(settlement_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"CSV too large (max {MAX_UPLOAD_BYTES//1024//1024} MB per file)")
+        if len(orders_bytes) == 0 or len(settlement_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty CSV file")
         orders_df = pd.read_csv(io.BytesIO(orders_bytes))
         settlement_df = pd.read_csv(io.BytesIO(settlement_bytes))
+        if len(orders_df) > MAX_ROWS or len(settlement_df) > MAX_ROWS:
+            raise HTTPException(status_code=413, detail=f"Too many rows (max {MAX_ROWS} per file)")
+        if "order_id" not in orders_df.columns or "order_id" not in settlement_df.columns:
+            raise HTTPException(status_code=400, detail="Both CSVs must have 'order_id' column")
+        # Make upload amount-only: blank status so webhook integrity cases don't pollute the demo
+        # (full pipeline replays webhooks; upload path just proves matching works on your data)
+        if "status" in orders_df.columns:
+            orders_df = orders_df.copy()
+            orders_df["status"] = None
         matched, exceptions = reconcile.reconcile(orders_df, settlement_df)
         summary = reconcile.summarize(matched, exceptions)
         # classify top exceptions for preview
@@ -347,8 +514,15 @@ async def reconcile_upload(request: __import__("fastapi").Request):
                 c = classify_exception(row)
             except Exception:
                 c = {"classification": "unresolved", "audit_note": ""}
-            preview.append({"order_id": str(r.get("order_id")), "reason": str(r.get("reason")), **c, "diff": float(r.get("diff")) if pd.notna(r.get("diff")) else None})
-        return {"summary": summary, "preview": preview, "matched_count": len(matched), "exceptions_count": len(exceptions)}
+            preview.append({**c, "order_id": str(r.get("order_id")), "reason": str(r.get("reason")), "diff": float(r.get("diff")) if pd.notna(r.get("diff")) else None})
+        return {
+            "summary": summary,
+            "preview": preview,
+            "matched_count": len(matched),
+            "exceptions_count": len(exceptions),
+            "mode": "amount_only",
+            "note": "Amount-only reconciliation (status column ignored). Full pipeline replays webhooks and shows 80.3% on synthetic data; upload shows ~85.2% — the delta is 3 status_mismatch cases from planted bad signatures.",
+        }
     except HTTPException:
         raise
     except Exception as e:

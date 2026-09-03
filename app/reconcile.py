@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.config import TOLERANCE, TDS_RATE, TDS_BAND, tolerance
+from app.config import TOLERANCE, TDS_RATE, TDS_BAND, TDS_RATES, tds_rate_for, tolerance
 
 # settlement_status values that mean "money actually moved"
 SETTLED_STATES = {"captured"}
@@ -91,14 +91,16 @@ def reconcile(orders_df: pd.DataFrame, settlement_df: pd.DataFrame):
         # Above tolerance: candidate for AI. Tag a hint for the classifier.
         # Use gross amount for TDS rate check; only shortfalls (settled < calc) can be TDS
         # diff is abs, so also check settled < calc
+        # Category-aware: pick rate per merchant category (still simplified)
         is_shortfall = row["amount_settled"] < row["amount_calc"]
+        tds_rate = tds_rate_for(row.get("category"))
         if is_shortfall and row["amount"] and not pd.isna(row["amount"]) and row["amount"] != 0:
             gap_rate = row["diff"] / float(row["amount"])
-            if TDS_RATE - TDS_BAND <= gap_rate <= TDS_RATE + TDS_BAND:
+            if tds_rate - TDS_BAND <= gap_rate <= tds_rate + TDS_BAND:
                 return "exception_tds_candidate"
         # Fallback: also try calc-based rate for backwards compat (small orders rounding)
         gap_rate_calc = (row["diff"] / row["amount_calc"]) if row["amount_calc"] else 0
-        if is_shortfall and TDS_RATE - TDS_BAND <= gap_rate_calc <= TDS_RATE + TDS_BAND:
+        if is_shortfall and tds_rate - TDS_BAND <= gap_rate_calc <= tds_rate + TDS_BAND:
             return "exception_tds_candidate"
         return "exception_unexplained"
 

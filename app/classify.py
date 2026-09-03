@@ -5,10 +5,18 @@ genuinely ambiguous) reach this module. Each gets a single classification and
 a one-sentence audit note. If no Anthropic key is configured the module falls
 back to a deterministic heuristic so the demo still runs end-to-end — but the
 real submission should have the key set.
+
+Scale note: run_pipeline() batches + caches so 1000s of exceptions don't
+cost 1000s of API calls. Cache key = hash(order_id, reason, diff).
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from app.config import anthropic_api_key, anthropic_model
 
@@ -121,6 +129,13 @@ def classify_exception(row: dict) -> dict:
     if client is None:
         return _heuristic_classify(row)
 
+    # Cache hit? (hash of stable fields so re-runs don't re-pay)
+    cache_key = _cache_key(row)
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+
     prompt = CLASSIFY_PROMPT.format(
         amount=row.get("amount", ""),
         amount_calc=row.get("amount_calc", ""),
@@ -139,7 +154,10 @@ def classify_exception(row: dict) -> dict:
         # Defensive: ensure content exists
         if not resp.content or not hasattr(resp.content[0], "text"):
             raise ValueError("empty response")
-        return _parse(resp.content[0].text)
+        result = _parse(resp.content[0].text)
+        if cache_key:
+            _cache_set(cache_key, result)
+        return result
     except Exception as exc:  # never let the AI block the pipeline
         # Log once, fallback deterministically
         fallback = _heuristic_classify(row)
@@ -147,3 +165,93 @@ def classify_exception(row: dict) -> dict:
         short_exc = str(exc)[:120].replace("\n", " ")
         fallback["audit_note"] = f"[AI call failed: {short_exc}] {fallback['audit_note']}"
         return fallback
+
+
+# --- batch + cache (scale fix) ----------------------------------------------
+
+CACHE_PATH = Path(__file__).resolve().parent.parent / ".classify_cache.json"
+_CACHE: dict | None = None
+
+def _cache_key(row: dict) -> str | None:
+    try:
+        # Stable key: order_id + reason + diff (rounded) + amount_calc
+        oid = str(row.get("order_id", ""))
+        reason = str(row.get("reason", ""))
+        diff = str(round(float(row.get("diff", 0) or 0), 2))
+        amt = str(row.get("amount_calc", ""))
+        raw = f"{oid}|{reason}|{diff}|{amt}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    except Exception:
+        return None
+
+def _cache_load() -> dict:
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE
+    if os.getenv("LEDGER_NO_CACHE", "").lower() in ("1", "true", "yes"):
+        _CACHE = {}
+        return _CACHE
+    try:
+        if CACHE_PATH.exists():
+            _CACHE = json.loads(CACHE_PATH.read_text())
+            if not isinstance(_CACHE, dict):
+                _CACHE = {}
+        else:
+            _CACHE = {}
+    except Exception:
+        _CACHE = {}
+    return _CACHE
+
+def _cache_get(key: str) -> dict | None:
+    d = _cache_load()
+    v = d.get(key)
+    if isinstance(v, dict) and "classification" in v:
+        return v
+    return None
+
+def _cache_set(key: str, value: dict) -> None:
+    if os.getenv("LEDGER_NO_CACHE", "").lower() in ("1", "true", "yes"):
+        return
+    d = _cache_load()
+    d[key] = value
+    try:
+        # atomic-ish: write to temp then rename
+        tmp = CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=2))
+        tmp.replace(CACHE_PATH)
+    except Exception:
+        pass
+
+def classify_exceptions_batch(rows: list[dict], max_workers: int = 5) -> list[dict]:
+    """Classify many rows in parallel with cache. Returns list aligned with input."""
+    if not rows:
+        return []
+    # If no API key, just heuristic — no need for threads
+    if not anthropic_api_key():
+        return [_heuristic_classify(r) for r in rows]
+    # Pre-check cache to avoid spawning threads for hits
+    results: list[dict | None] = [None] * len(rows)
+    to_call: list[tuple[int, dict]] = []
+    for i, r in enumerate(rows):
+        k = _cache_key(r)
+        if k:
+            c = _cache_get(k)
+            if c:
+                results[i] = c
+                continue
+        to_call.append((i, r))
+    if to_call:
+        # ThreadPool — IO-bound (HTTP), not CPU
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(to_call))) as pool:
+            fut_to_idx = {pool.submit(classify_exception, r): i for i, r in to_call}
+            for fut in as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception as e:
+                    results[idx] = {"classification": "unresolved", "audit_note": f"batch classify failed: {e}"}
+    # Fill any None (shouldn't happen)
+    for i, v in enumerate(results):
+        if v is None:
+            results[i] = _heuristic_classify(rows[i])
+    return results  # type: ignore

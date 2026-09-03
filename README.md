@@ -214,6 +214,17 @@ python -m app.main --clear-only                     # wipe DB without deleting f
 
 ---
 
+## Limitations & next steps — honest caveat (read before demo)
+
+We disclose simplifications so judges can evaluate credibility:
+
+- **Synthetic data:** The 80.3% number is on Faker-generated data with planted edge cases. The upload path (`Bring Your Own CSV`) lets you test on *your* data — "it survived data we didn't design" is the stronger claim. Try it before demo day.
+- **TDS detection:** A flat statistical band (2% ±0.5pp, now category-aware but still flat per category) — not real TDS/TCS law, which varies by threshold, certificate, and section. The code labels this `exception_tds_candidate` → `expected_tds_withholding` as a *candidate*, not certainty. `app/config.py:tds_rate_for()` is the hook to plug in real rules.
+- **Matching model:** 1:1 order↔settlement via outer join. Real Razorpay settlements are often *batched* (many orders in one bank credit + UTR). Next step is an aggregation layer (group by UTR/date, then match sums).
+- **Scale:** SQLite + full-dataframe Pandas is correct for a hackathon demo (60 rows → 10k rows fine). For production: Postgres + incremental reconciliation (only new settlements) + `classify_exceptions_batch()` with cache already ships — re-runs don't re-pay for unchanged rows, and ThreadPool handles thousands in parallel. See `LEDGER_NO_CACHE=1` to force fresh calls.
+
+---
+
 ## What makes it trustworthy?
 
 - **Nothing is silently ignored.** Every row gets an audit entry, even duplicates and bad signatures.
@@ -227,6 +238,22 @@ python -m app.main --clear-only                     # wipe DB without deleting f
 
 - `docs/dev-log.md` — real bug we hit (0% match rate) and how the audit log helped us find it
 - `docs/architecture.png` — diagram above (generate with `python scripts/generate_architecture.py`)
+- `docs/demo.gif` — animated walkthrough (generate with `python scripts/generate_demo_gif.py`)
+
+---
+
+## Troubleshooting
+
+**`Failed to fetch: https://github.com/.../tree/main/app`** — that URL is an HTML page, not a raw file. Don't `fetch` it. Instead:
+```bash
+git clone https://github.com/abiralpokhrel-learns/ledger-sentinel.git
+cd ledger-sentinel
+```
+Or fetch raw files via `https://raw.githubusercontent.com/abiralpokhrel-learns/ledger-sentinel/main/app/main.py`. The `app/` folder is tracked — `git status` should show it, and `ls app/` should list 8 files.
+
+**Port already in use** — set `LEDGER_DASHBOARD_PORT` or `LEDGER_CHECK_PORT` before running smoke checks.
+
+**DB locked on Windows** — use `python -m app.main --clear-only` instead of deleting `ledger_sentinel.db`.
 
 ---
 

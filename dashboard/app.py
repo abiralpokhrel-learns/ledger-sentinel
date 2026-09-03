@@ -279,7 +279,8 @@ with left:
 
 with right:
     st.markdown("### ⤓ Bring your own data — reconcile now")
-    st.caption("Upload your own orders.csv + settlement.csv to test live. No data is stored.")
+    st.caption("Upload your own orders.csv + settlement.csv to test live. No data is stored. Amount-only mode (webhook status ignored).")
+    st.info("**Note:** Upload does amount-only matching (like the README's 85.2% on sample files). The full pipeline (`python -m app.main`) replays webhooks and shows 80.3% — the 3-row delta is the planted bad-signature test.", icon="ℹ️")
     with st.form("upload_form", clear_on_submit=False):
         up_orders = st.file_uploader("orders.csv", type=["csv"], key="up_orders")
         up_sett = st.file_uploader("settlement.csv", type=["csv"], key="up_sett")
@@ -291,6 +292,14 @@ with right:
             try:
                 orders_up = pd.read_csv(up_orders)
                 sett_up = pd.read_csv(up_sett)
+                # Enforce same guards as API (5MB already by Streamlit, but check rows)
+                if len(orders_up) > 10000 or len(sett_up) > 10000:
+                    st.error("Too many rows (max 10,000 per file).")
+                    st.stop()
+                # Amount-only: ignore status column (webhook integrity is pipeline-only)
+                if "status" in orders_up.columns:
+                    orders_up = orders_up.copy()
+                    orders_up["status"] = None
                 from app.reconcile import reconcile as do_reconcile, summarize
                 from app.classify import classify_exception
                 m, e = do_reconcile(orders_up, sett_up)

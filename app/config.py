@@ -72,10 +72,28 @@ def is_strict() -> bool:
 TOLERANCE = 0.01
 
 # Expected withholding band for the AI classifier to recognise as TDS/TCS.
-# Gap as a fraction of gross order amount. Anything in this band and not a
-# clean match is treated as a candidate "expected_tds_withholding".
-TDS_RATE = 0.02  # 2% — representative TDS/TCS-shaped deduction
+# SIMPLIFICATION (disclosed): This is a flat statistical band, not real tax
+# logic. Real TDS/TCS varies by category, amount threshold, certificates
+# and time period. For the hackathon we use 2% ±0.5pp as a representative
+# shape. Category-aware rates are applied below, but still simplified.
+# See README "Limitations & next steps" for the honest caveat.
+TDS_RATE = 0.02  # 2% — representative TDS/TCS-shaped deduction (legacy constant)
 TDS_BAND = 0.005  # +/- 0.5pp slack around the nominal rate
+# Category-aware rates (still simplified — real rules need thresholds+certs)
+# All set to 2% for demo stability; adjust per-category as real rules become known.
+TDS_RATES = {
+    "professional_services": 0.02,
+    "consulting": 0.02,
+    "software": 0.02,
+    "retail_goods": 0.02,
+    "food": 0.02,
+}
+DEFAULT_TDS_RATE = 0.02
+
+def tds_rate_for(category: str | None) -> float:
+    if not category:
+        return DEFAULT_TDS_RATE
+    return TDS_RATES.get(str(category).lower(), DEFAULT_TDS_RATE)
 
 # Re-export for tests that import TOLERANCE directly
-__all__ = ["webhook_secret", "db_path", "anthropic_api_key", "anthropic_model", "mcp_mode", "tolerance", "is_strict", "TOLERANCE", "TDS_RATE", "TDS_BAND"]
+__all__ = ["webhook_secret", "db_path", "anthropic_api_key", "anthropic_model", "mcp_mode", "tolerance", "is_strict", "TOLERANCE", "TDS_RATE", "TDS_BAND", "TDS_RATES", "DEFAULT_TDS_RATE", "tds_rate_for"]

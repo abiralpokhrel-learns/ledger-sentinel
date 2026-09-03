@@ -51,14 +51,41 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 
 def get_connection(db_path: str | Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+    except Exception:
+        pass
     return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
+
+
+def clear_all(conn: sqlite3.Connection) -> None:
+    """Wipe all pipeline tables so a re-run is idempotent without deleting the file.
+
+    Useful on Windows where the DB file is often locked by a running uvicorn/
+    streamlit process and `rm ledger_sentinel.db` fails with PermissionError.
+    """
+    conn.executescript(
+        """
+        DELETE FROM audit_log;
+        DELETE FROM webhook_events;
+        DELETE FROM settlement;
+        DELETE FROM orders;
+        DELETE FROM sqlite_sequence WHERE name='audit_log';
+        """
+    )
+    conn.commit()
+    try:
+        conn.execute("VACUUM;")
+    except Exception:
+        pass
 
 
 # --- orders -----------------------------------------------------------------

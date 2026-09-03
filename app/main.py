@@ -31,9 +31,22 @@ app = FastAPI(title="Ledger Sentinel")
 # Mount the webhook routes.
 app.include_router(webhook.app.router)
 
-# Shared connection for live webhook ingestion.
-app.state.db = db.get_connection(db_path())
-db.init_db(app.state.db)
+
+@app.on_event("startup")
+def _startup():
+    # Lazily open the shared DB on startup, not at import time.
+    # Import-time open locks the file on Windows and makes `rm db` fail.
+    conn = db.get_connection(db_path())
+    db.init_db(conn)
+    app.state.db = conn
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    try:
+        app.state.db.close()
+    except Exception:
+        pass
 
 
 def _load_orders(conn, data_dir: Path):
@@ -91,7 +104,12 @@ def _load_settlement(conn, data_dir: Path):
         )
 
 
-def run_pipeline(conn, data_dir: Path = DATA_DIR) -> dict:
+def run_pipeline(conn, data_dir: Path = DATA_DIR, fresh: bool = True) -> dict:
+    if fresh:
+        # Make re-runs idempotent without requiring `rm ledger_sentinel.db`.
+        # On Windows that delete often fails with PermissionError because
+        # uvicorn/streamlit holds a WAL handle.
+        db.clear_all(conn)
     secret = webhook_secret()
     _load_orders(conn, data_dir)
     _process_webhook_events(conn, data_dir, secret)
@@ -127,10 +145,10 @@ def health():
 
 
 @app.post("/run-pipeline")
-def run_pipeline_endpoint():
+def run_pipeline_endpoint(fresh: bool = True):
     conn = db.get_connection(db_path())
     db.init_db(conn)
-    summary = run_pipeline(conn)
+    summary = run_pipeline(conn, fresh=fresh)
     conn.close()
     return summary
 
@@ -141,12 +159,25 @@ def main():
         "--db", default=db_path(),
         help="SQLite database path (default: from LEDGER_DB_PATH env)",
     )
+    parser.add_argument(
+        "--no-fresh", action="store_true",
+        help="Do NOT wipe DB before run (append mode, for debugging)",
+    )
+    parser.add_argument(
+        "--clear-only", action="store_true",
+        help="Only clear the DB and exit (alternative to rm on Windows)",
+    )
     args = parser.parse_args()
 
     conn = db.get_connection(args.db)
     db.init_db(conn)
+    if args.clear_only:
+        db.clear_all(conn)
+        conn.close()
+        print(f"Cleared {args.db} (tables + audit_log). No file delete needed.")
+        return
     print("Running Ledger Sentinel pipeline on synthetic batch...\n")
-    summary = run_pipeline(conn, DATA_DIR)
+    summary = run_pipeline(conn, DATA_DIR, fresh=not args.no_fresh)
     conn.close()
 
     print("\n=== Reconciliation summary ===")

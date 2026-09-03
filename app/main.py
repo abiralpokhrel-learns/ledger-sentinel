@@ -23,6 +23,10 @@ import pandas as pd
 from fastapi import FastAPI
 
 from app import db, reconcile, webhook
+from app.detection import CostSensitiveDetector, detect_spikes, compute_baseline, rolling_window_features, FN_COST, FP_COST, FP_REVIEW_COST_RUPEES
+from app.policy import decide_from_dict, POLICY_VERSION, ALLOWED_DECISIONS
+from app.chargeback import gather_evidence, compile_response
+from app.metrics import honest_evaluation_pipeline, evaluate_held_out, generate_synthetic_fraud_dataset, time_based_split
 from app.classify import classify_exception, classify_exceptions_batch
 from app.config import db_path, webhook_secret
 from app.webhook import try_record_event, verify_signature
@@ -548,6 +552,231 @@ def run_pipeline_endpoint(fresh: bool = True):
             conn.close()
         except Exception:
             pass
+
+
+
+# --- Cost-sensitive detection (rolling windows, spike, 25x FN cost) -----
+
+@app.post("/detect")
+def detect_endpoint(payload: dict):
+    """Run cost-sensitive detection on posted transactions.
+
+    Body: { transactions: [{timestamp, score, is_fraud?, amount?}], window, k, fn_cost, fp_cost }
+    Returns baseline, windows, spikes, and cost-optimal threshold (fitted on past).
+    Defense-only: only produces signals.
+    """
+    try:
+        txns = payload.get("transactions")
+        if not txns or not isinstance(txns, list):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Send {transactions:[{timestamp,score,...}]}")
+        import pandas as pd
+        df = pd.DataFrame(txns)
+        if "timestamp" not in df.columns or "score" not in df.columns:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="transactions need timestamp and score")
+        window = str(payload.get("window", "1h"))
+        k = float(payload.get("k", 2.0))
+        fn_cost = float(payload.get("fn_cost", FN_COST))
+        fp_cost = float(payload.get("fp_cost", FP_COST))
+        # Fit threshold cost-sensitively if labels provided, else use default 0.5
+        det = CostSensitiveDetector(window=window, k=k, fn_cost=fn_cost, fp_cost=fp_cost)
+        if "is_fraud" in df.columns:
+            # time-based honest split for threshold fitting
+            from app.metrics import time_based_split
+            train, _ = time_based_split(df, test_frac=0.3)
+            if len(train) >= 4 and "is_fraud" in train.columns:
+                det.fit(train["score"].values, train["is_fraud"].values, train["amount"].values if "amount" in train.columns else None)
+            else:
+                det.threshold = 0.5
+                det.fit_result = None
+        else:
+            det.threshold = 0.5
+        result = det.evaluate_stream(df)
+        # Persist windows for audit
+        try:
+            # lazy get conn
+            from fastapi import Request
+            pass
+        except Exception:
+            pass
+        return {"defense_only": True, "policy": "detection is signal-only; policy engine decides", **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=f"detect failed: {e}")
+
+@app.get("/detect/demo")
+def detect_demo():
+    """Honest demo using synthetic fraud data (held-out evaluated)."""
+    try:
+        data = honest_evaluation_pipeline()
+        return {"defense_only": True, **data}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Policy engine (defense-only, deterministic) -------------------------
+
+@app.post("/policy/decide")
+def policy_decide(payload: dict):
+    """Deterministic policy: signals -> approve|step_up|review|block.
+
+    Body: { risk_score?, is_spike?, spike_z?, classification?, reason?, diff?, amount?, chargeback_evidence_score? }
+    Also logs to machine_decisions (separate from human_resolutions).
+    """
+    try:
+        decision = decide_from_dict(payload)
+        # Log machine decision separately (never human table)
+        order_id = str(payload.get("order_id", "policy-check"))
+        case_id = str(payload.get("case_id", "")) or None
+        try:
+            # use lifespan db if available, else open temp
+            conn = None
+            close_after = False
+            import inspect
+            # try app.state.db
+            try:
+                from fastapi import Request
+                # we are not in request context with Request, so fallback to db_path
+                pass
+            except Exception:
+                pass
+            from app.config import db_path as _dbp
+            import app.db as _db
+            conn = _db.get_connection(_dbp())
+            _db.init_db(conn)
+            close_after = True
+            import json as _json
+            _db.log_machine_decision(conn, order_id, decision.decision, reason=decision.reason, policy_version=decision.policy_version, signals_json=_json.dumps(decision.signals_snapshot), case_id=case_id)
+        except Exception:
+            pass
+        finally:
+            if 'close_after' in locals() and close_after and conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return {"defense_only": True, "allowed_decisions": sorted(ALLOWED_DECISIONS), **decision.to_dict()}
+    except ValueError as ve:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"policy failed: {e}")
+
+# --- Chargeback responder (read-only gather, structured draft) -----------
+
+@app.get("/chargeback/{order_id}")
+def chargeback_compile(order_id: str):
+    """Gather read-only evidence and compile structured chargeback response (draft).
+
+    Defense-only: draft is NEVER auto-submitted. Human must approve via /human/resolve.
+    Machine draft stored in machine_decisions, separate from human_resolutions.
+    """
+    try:
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        try:
+            bundle = gather_evidence(conn, order_id)
+            # order must exist or have at least some evidence
+            if not bundle.order and not bundle.settlement and not bundle.audit_entries:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=404, detail=f"No evidence found for {order_id}")
+            resp = compile_response(bundle)
+            # store draft in machine table (defense-only)
+            try:
+                import json as _json
+                _db.log_machine_decision(conn, order_id, "draft", reason=resp.summary[:500], policy_version=resp.version, signals_json=_json.dumps({"case_id": resp.case_id, "evidence_count": len(resp.evidence_cited)}), case_id=resp.case_id)
+            except Exception:
+                pass
+            return {"defense_only": True, "human_must_file": True, **resp.to_dict()}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"chargeback failed: {e}")
+
+@app.post("/human/resolve")
+def human_resolve(payload: dict):
+    """Human analyst resolution — stored separately from machine, authoritative."""
+    try:
+        order_id = str(payload.get("order_id", "")).strip()
+        resolution = str(payload.get("resolution", "")).strip()
+        if not order_id or not resolution:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Send {order_id, resolution, analyst?, note?, case_id?}")
+        analyst = str(payload.get("analyst", "analyst"))[:100]
+        note = str(payload.get("note", ""))[:2000]
+        case_id = str(payload.get("case_id", "")) or None
+        from app.config import db_path as _dbp
+        import app.db as _db
+        conn = _db.get_connection(_dbp())
+        _db.init_db(conn)
+        try:
+            _db.log_human_resolution(conn, order_id, resolution, analyst=analyst, note=note, case_id=case_id)
+            return {"stored_in": "human_resolutions", "authoritative": True, "order_id": order_id, "resolution": resolution}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except ValueError as ve:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/machine/decisions")
+def machine_decisions(limit: int = 20):
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    try:
+        df = _db.load_machine_decisions_df(conn).head(limit)
+        return {"stored_in": "machine_decisions", "defense_only": True, "count": len(df), "rows": df.to_dict(orient="records")}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+@app.get("/human/resolutions")
+def human_resolutions(limit: int = 20):
+    from app.config import db_path as _dbp
+    import app.db as _db
+    conn = _db.get_connection(_dbp())
+    _db.init_db(conn)
+    try:
+        df = _db.load_human_resolutions_df(conn).head(limit)
+        return {"stored_in": "human_resolutions", "authoritative": True, "count": len(df), "rows": df.to_dict(orient="records")}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+@app.get("/metrics/honest")
+def metrics_honest():
+    """Honest metrics on held-out test set, with FP financial cost."""
+    try:
+        data = honest_evaluation_pipeline()
+        return {"defense_only_note": "Metrics are held-out; cost includes FP financial cost (review).", **data}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def main():

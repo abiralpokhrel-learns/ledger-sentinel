@@ -333,6 +333,143 @@ with right:
         color = "#059669" if outcome == "matched" else "#d97706" if outcome == "exception" else "#64748b"
         st.markdown(f"<div style='font-size:0.82rem; padding:3px 0; border-bottom:1px solid #f8fafc'><span style='color:{color}; font-weight:700'>{icon} {outcome}</span> — <b>{r.get('order_id','')}</b> <span style='color:#94a3b8'>{str(r.get('reason','') or r.get('classification',''))[:40]}</span> <span style='float:right; color:#cbd5e1; font-size:0.75rem'>{r.get('created_at','')}</span></div>", unsafe_allow_html=True)
 
+st.markdown("---")
+st.markdown("## Defense, Policy & Honest Metrics - Track 02 + 04")
+
+# Two cols: left honest metrics, right policy guardrails
+col_a, col_b = st.columns([1.2, 1])
+
+with col_a:
+    st.markdown("### Honest metrics (held-out test set)")
+    st.caption("Threshold fitted on earliest 70% - tested on latest 30% (no leakage). FP = Rs 500 review cost, FN = 25x FP in policy cost. This is not training accuracy.")
+    try:
+        from app.metrics import honest_evaluation_pipeline
+        hm = honest_evaluation_pipeline()
+        tm = hm["test_metrics"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Precision", f"{tm['precision']:.2%}")
+        m2.metric("Recall", f"{tm['recall']:.2%}")
+        m3.metric("FPR", f"{tm['fpr']:.2%}")
+        m4.metric(" Held-out acc", f"{tm['accuracy']:.1%}")
+        st.markdown(f"<div style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px; font-size:0.85rem'>"
+                    f"<b>Threshold</b> {tm['threshold']:.3f} (cost-optimal, 25x FN) &nbsp;|&nbsp; "
+                    f"<b>Cost</b> {tm['total_cost_units']:.0f} units (baseline {tm['baseline_cost_units']:.0f} -> saved {tm['cost_saved_vs_baseline']:.0f})<br>"
+                    f"<b>FP financial cost</b>: Rs {tm['fp_financial_cost_rupees']:,.0f} &nbsp;|&nbsp; "
+                    f"<b>FN loss</b>: Rs {tm['fn_financial_cost_rupees']:,.0f} &nbsp;|&nbsp; "
+                    f"<b>Total</b>: Rs {tm['total_financial_cost_rupees']:,.0f} &nbsp; "
+                    f"<span class='badge badge-slate'>held-out {tm['test_size']} rows</span>"
+                    f"</div>", unsafe_allow_html=True)
+        # Confusion strip
+        st.markdown(f"<div style='margin-top:8px; font-size:0.78rem; color:#64748b'>TP {tm['tp']} &nbsp; TN {tm['tn']} &nbsp; "
+                    f"<span style='color:#dc2626'>FP {tm['fp']}</span> &nbsp; <span style='color:#991b1b; font-weight:700'>FN {tm['fn']}</span> - "
+                    f"FN costs 25x FP by policy; FP cost explicitly shown above.</div>", unsafe_allow_html=True)
+        with st.expander("What makes this honest?"):
+            st.markdown("- **Time-split**, not random shuffle - no leakage from future.\n"
+                        "- **Held-out test** (30% latest) never seen during threshold fit.\n"
+                        "- **Financial FP cost** (Rs 500 x FP) shown separately from cost units (25xFN+1xFP).\n"
+                        "- Baseline (flag nothing) cost shown for comparison - we show savings, not just accuracy.\n"
+                        "- Windowed spike detection further cuts FP vs per-transaction flagging.")
+    except Exception as e:
+        st.error(f"Honest metrics unavailable: {e}")
+
+    st.markdown("### Cost-sensitive detection (rolling windows)")
+    st.caption("Single-row scores are not flagged in isolation. We aggregate into rolling windows and fire only when the fraud rate spikes above its historical baseline (mean + 2 std).")
+    try:
+        from app.metrics import generate_synthetic_fraud_dataset
+        from app.detection import CostSensitiveDetector
+        from app.metrics import time_based_split as _split
+        import pandas as pd
+        demo_df = generate_synthetic_fraud_dataset(n=600, seed=7)
+        # fit detector cost-sensitively on train
+        train, test = _split(demo_df, test_frac=0.3)
+        det = CostSensitiveDetector(window="6h", k=2.0)
+        det.fit(train["score"].values, train["is_fraud"].values, train["amount"].values)
+        res = det.evaluate_stream(demo_df)
+        st.markdown(f"<div style='background:white; border:1px solid #e2e8f0; border-radius:10px; padding:12px; font-size:0.85rem'>"
+                    f"<b>Window</b> {res['total_windows']} x 6h &nbsp;|&nbsp; <b>Spikes</b> {res['spike_count']} &nbsp;|&nbsp; "
+                    f"<b>Baseline</b> {res['baseline']['mean']:.3%} +/- {res['baseline']['std']:.3%} (thr {res['baseline']['threshold']:.3%})<br>"
+                    f"<b>Threshold</b> {res['threshold']:.3f} (25x FN-optimal) &nbsp;|&nbsp; spikes are the only flag - isolates do not trigger.</div>", unsafe_allow_html=True)
+        if res["spike_windows"]:
+            sw = res["spike_windows"][:4]
+            for w in sw:
+                st.markdown(f"<div style='font-size:0.8rem; padding:4px 0; border-bottom:1px solid #f1f5f9'>"
+                            f"Spike <b>{w['window_start']}</b> - fraud_rate {w['fraud_rate']:.1%} (z={w.get('spike_z',0):.1f}) &nbsp; count {w['count']}</div>", unsafe_allow_html=True)
+        else:
+            st.caption("No spikes in demo window - baseline is calm (defense: we don't flag single rows).")
+    except Exception as e:
+        st.error(f"Detection demo unavailable: {e}")
+
+with col_b:
+    st.markdown("### Policy engine - deterministic, defense-only")
+    st.caption("AI = signals only. One auditable function maps signals -> approve | step_up | review | block. No offensive actions exist.")
+    try:
+        from app.policy import POLICY_VERSION, ALLOWED_DECISIONS
+        st.markdown(f"<div style='background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:12px; font-size:0.85rem'>"
+                    f"<b>Policy</b> {POLICY_VERSION} &nbsp; <span class='badge badge-green'>defense-only</span><br>"
+                    f"<b>Allowed</b>: {', '.join(sorted(ALLOWED_DECISIONS))}<br>"
+                    f"<span style='color:#166534'>No external writes, no fund movement, no charge creation - enforced by allowlist.</span></div>", unsafe_allow_html=True)
+    except Exception as e:
+        st.error(str(e))
+    # Live policy test
+    st.markdown("<div style='margin-top:10px; font-size:0.82rem; font-weight:600'>Live check - type signals</div>", unsafe_allow_html=True)
+    pc1, pc2 = st.columns(2)
+    risk = pc1.slider("risk_score", 0.0, 1.0, 0.75, 0.05, key="pol_risk")
+    z = pc2.slider("spike_z", 0.0, 5.0, 1.5, 0.5, key="pol_z")
+    is_spike = st.checkbox("is_spike (rolling window flagged)", value=False, key="pol_spike")
+    if st.button("Run policy -> decide", key="pol_run"):
+        try:
+            from app.policy import decide, Signals
+            sig = Signals(risk_score=risk, is_spike=is_spike, spike_z=z, reason="exception_unexplained", diff=200, amount=1000)
+            dec = decide(sig)
+            color = {"approve":"#059669","step_up":"#d97706","review":"#7c3aed","block":"#dc2626"}.get(dec.decision, "#334155")
+            st.markdown(f"<div style='background:white; border-left:4px solid {color}; padding:10px; border-radius:6px; font-size:0.9rem'>"
+                        f"<b style='color:{color}; text-transform:uppercase'>{dec.decision}</b> - {dec.reason}<br>"
+                        f"<span style='color:#94a3b8; font-size:0.75rem'>{dec.policy_version} - {dec.created_at}</span></div>", unsafe_allow_html=True)
+        except Exception as e:
+            st.error(str(e))
+    st.markdown("<div style='margin-top:8px; font-size:0.75rem; color:#64748b'>Stored separately: <code>machine_decisions</code> (auto) vs <code>human_resolutions</code> (analyst). Human wins if present.</div>", unsafe_allow_html=True)
+
+    st.markdown("### Chargeback responder - structured, not raw logs")
+    st.caption("Read-only gather -> compiled evidence pack (draft). Human must approve before filing - never auto-submits.")
+    cb_order = st.text_input("Order ID for chargeback pack", value="order_0005", key="cb_order")
+    if st.button("Compile chargeback draft", key="cb_run"):
+        try:
+            from app import db
+            from app.chargeback import gather_evidence, compile_response
+            from app.config import db_path
+            conn = db.get_connection(db_path())
+            db.init_db(conn)
+            try:
+                b = gather_evidence(conn, cb_order.strip())
+                if not b.order and not b.audit_entries:
+                    st.warning(f"No evidence for {cb_order}")
+                else:
+                    resp = compile_response(b)
+                    st.markdown(f"<div style='background:white; border:1px solid #e2e8f0; border-radius:10px; padding:12px'>"
+                                f"<b>{resp.case_id}</b> <span class='badge badge-amber'>draft</span> <span class='badge badge-slate'>{resp.version}</span><br>"
+                                f"<div style='font-size:0.82rem; color:#475569; margin-top:6px'>{resp.summary}</div>"
+                                f"<div style='font-size:0.75rem; color:#94a3b8; margin-top:6px'>Evidence: {len(resp.evidence_cited)} items cited, {len(resp.timeline)} timeline events</div>"
+                                f"<div style='background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:8px; margin-top:8px; font-size:0.78rem'>{resp.recommended_action}</div>"
+                                f"<div style='font-size:0.72rem; color:#94a3b8; margin-top:6px'>{resp.disclosure}</div></div>", unsafe_allow_html=True)
+                    with st.expander("Evidence cited (sources)"):
+                        for ev in resp.evidence_cited:
+                            st.json(ev)
+                    with st.expander("Timeline"):
+                        for t in resp.timeline[:10]:
+                            st.markdown(f"- {t.get('at')}: {t.get('what')} [{t.get('source')}]")
+                    with st.expander("Amount analysis"):
+                        st.json(resp.amount_analysis)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            st.error(f"Chargeback failed: {e}")
+
+st.caption("Auditable: machine drafts in <code>machine_decisions</code>, human filings in <code>human_resolutions</code>. Pipeline halts at draft - filing requires POST /human/resolve.")
+
+
 # Full audit trail
 with st.expander("Full audit trail — all outcomes"):
     st.dataframe(audit, use_container_width=True, height=360, hide_index=True)

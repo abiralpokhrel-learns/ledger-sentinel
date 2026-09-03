@@ -234,6 +234,17 @@ We disclose simplifications so judges can evaluate credibility:
 
 ---
 
+## New in this release — Track 02 defense (cost-sensitive, policy, chargeback)
+
+- **Cost-sensitive detection (25x FN cost)**: `app/detection.py` trains its threshold against `cost = 25*FN + 1*FP` (amount-weighted for FN), not accuracy. Rolling windows (`window="1h"/"6h"`) aggregate transactions; risk is flagged only when the window fraud-rate spikes above its historical baseline (`mean + 2*std`). Single-row anomalies that do not spike the window are not flagged — this is how we cut the financial cost of false positives vs naive per-transaction flagging.
+- **Active Chargeback Responder (Track 02)**: `app/chargeback.py` gathers evidence with *read-only* SELECTs (orders, settlement, webhook_events, audit_log) and compiles a structured, cited `ChargebackResponse` (summary, timeline, amount analysis, evidence Cited, recommended action). Status starts as `draft` — human must approve via `POST /human/resolve`. Never auto-submits; defense-only by design.
+- **Strict guardrails & separation**: `app/policy.py` is the *only* place hard outcomes (`approve|step_up|review|block`, `POLICY_VERSION=v1.0-defense-only`) are made — deterministic, auditable, allowlist-enforced. Offensive actions are blocked by keyword guard. `machine_decisions` (auto) and `human_resolutions` (analyst) are separate tables; `human` is authoritative if present (`GET /human/resolutions` vs `GET /machine/decisions`).
+- **Honest metrics (held-out)**: `app/metrics.py` uses a *time-based* train/test split (no leakage). Threshold is fitted on earliest 70%, evaluated on latest 30%. Dashboard and `GET /metrics/honest` show `precision/recall/FPR`, `total_cost = 25*FN+FP`, and explicit **financial cost of false positives** (`FP x Rs 500` review cost) + FN loss. Baseline (flag nothing) cost shown for comparison.
+
+**APIs added**: `POST /detect`, `GET /detect/demo`, `POST /policy/decide`, `GET /chargeback/{order_id}`, `POST /human/resolve`, `GET /machine/decisions`, `GET /human/resolutions`, `GET /metrics/honest`
+
+**Dashboard**: new "Defense, Policy & Honest Metrics" panel — honest metrics card (FP rupee cost), rolling-window spike demo, live policy playground, and chargeback pack compiler.
+
 ## Docs
 
 - `docs/dev-log.md` — real bug we hit (0% match rate) and how the audit log helped us find it

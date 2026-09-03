@@ -47,6 +47,45 @@ CREATE TABLE IF NOT EXISTS audit_log (
     audit_note   TEXT,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Defense-only separation: machine vs human decisions never co-mingled.
+-- machine_decisions: every automated outcome (policy engine, responder drafts).
+-- human_resolutions: analyst overrides / approvals — authoritative if present.
+CREATE TABLE IF NOT EXISTS machine_decisions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id       TEXT,
+    case_id        TEXT,
+    decision       TEXT,  -- approve | step_up | review | block | draft
+    reason         TEXT,
+    policy_version TEXT,
+    signals_json   TEXT,  -- snapshot of signals that drove the decision
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS human_resolutions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id       TEXT,
+    case_id        TEXT,
+    resolution     TEXT,  -- approve | step_up | review | block | filed | dismissed
+    analyst        TEXT,
+    note           TEXT,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS detection_windows (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_start     TEXT,
+    window_end       TEXT,
+    window_size      TEXT,
+    count            INTEGER,
+    fraud_count      INTEGER,
+    fraud_rate       REAL,
+    baseline_mean    REAL,
+    baseline_std     REAL,
+    threshold        REAL,
+    is_spike         INTEGER,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -70,6 +109,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_outcome ON audit_log(outcome);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_order ON audit_log(order_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_order ON webhook_events(order_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_machine_order ON machine_decisions(order_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_human_order ON human_resolutions(order_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_detection_window ON detection_windows(window_start);")
         conn.commit()
     except sqlite3.OperationalError as e:
         # If DB is locked or corrupted, surface a clear error instead of silent fail
@@ -88,7 +130,12 @@ def clear_all(conn: sqlite3.Connection) -> None:
         DELETE FROM webhook_events;
         DELETE FROM settlement;
         DELETE FROM orders;
+        DELETE FROM machine_decisions;
+        DELETE FROM human_resolutions;
+        DELETE FROM detection_windows;
         DELETE FROM sqlite_sequence WHERE name='audit_log';
+        DELETE FROM sqlite_sequence WHERE name='machine_decisions';
+        DELETE FROM sqlite_sequence WHERE name='human_resolutions';
         """
     )
     conn.commit()
@@ -226,6 +273,58 @@ def log_audit(conn, order_id, outcome, reason, classification=None, audit_note=N
         else:
             raise
 
+
+
+# --- machine / human separation (defense-only, auditable) -------------------
+
+def log_machine_decision(conn, order_id, decision, reason=None, policy_version=None, signals_json=None, case_id=None):
+    """Automated decision — never overwrites human. Defense-only values only."""
+    allowed = {"approve", "step_up", "review", "block", "draft", "flagged", "no_spike"}
+    if decision not in allowed:
+        raise ValueError(f"Decision {decision!r} not in defense-only allowlist {allowed}")
+    conn.execute(
+        """INSERT INTO machine_decisions (order_id, case_id, decision, reason, policy_version, signals_json)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (order_id, case_id, decision, reason[:2000] if reason else None, policy_version, signals_json[:8000] if signals_json else None),
+    )
+    conn.commit()
+
+def log_human_resolution(conn, order_id, resolution, analyst=None, note=None, case_id=None):
+    """Human analyst resolution — authoritative. Separate table by design."""
+    allowed = {"approve", "step_up", "review", "block", "filed", "dismissed", "approved"}
+    if resolution not in allowed:
+        raise ValueError(f"Resolution {resolution!r} not in allowlist {allowed}")
+    conn.execute(
+        """INSERT INTO human_resolutions (order_id, case_id, resolution, analyst, note)
+           VALUES (?, ?, ?, ?, ?)""",
+        (order_id, case_id, resolution, analyst, note[:2000] if note else None),
+    )
+    conn.commit()
+
+def load_machine_decisions_df(conn) -> "pd.DataFrame":
+    try:
+        return pd.read_sql("SELECT * FROM machine_decisions ORDER BY id DESC", conn)
+    except Exception:
+        return pd.DataFrame(columns=["id","order_id","case_id","decision","reason","policy_version","signals_json","created_at"])
+
+def load_human_resolutions_df(conn) -> "pd.DataFrame":
+    try:
+        return pd.read_sql("SELECT * FROM human_resolutions ORDER BY id DESC", conn)
+    except Exception:
+        return pd.DataFrame(columns=["id","order_id","case_id","resolution","analyst","note","created_at"])
+
+def get_final_outcome(conn, order_id: str) -> str | None:
+    """Human wins if present, else machine."""
+    try:
+        r = conn.execute("SELECT resolution FROM human_resolutions WHERE order_id = ? ORDER BY id DESC LIMIT 1", (order_id,)).fetchone()
+        if r and r[0]:
+            return f"human:{r[0]}"
+        r = conn.execute("SELECT decision FROM machine_decisions WHERE order_id = ? ORDER BY id DESC LIMIT 1", (order_id,)).fetchone()
+        if r and r[0]:
+            return f"machine:{r[0]}"
+    except Exception:
+        pass
+    return None
 
 # --- loaders for reconciliation / dashboard ---------------------------------
 

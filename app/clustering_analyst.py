@@ -159,7 +159,7 @@ def _validate_sql(sql: str) -> tuple[bool, str]:
 def _heuristic_sql(question: str) -> str:
     q = question.lower()
     if "how much" in q and ("held" in q or "at risk" in q or "exception" in q):
-        return "SELECT COUNT(*) as exceptions, COALESCE(SUM(CAST(diff AS REAL)),0) as amount_at_risk FROM audit_log WHERE outcome='exception'"
+        return "SELECT outcome, COUNT(*) as count FROM audit_log WHERE outcome='exception' GROUP BY outcome"
     if "match rate" in q or "matched" in q:
         return "SELECT SUM(outcome='matched') as matched, SUM(outcome='exception') as exceptions, COUNT(*) as total FROM audit_log WHERE outcome IN ('matched','exception')"
     if "tds" in q:
@@ -285,15 +285,22 @@ def build_investigation_report(conn: sqlite3.Connection, order_id: str) -> dict:
     }
 
 
+def _safe_pdf(s: str) -> str:
+    if s is None:
+        return ""
+    return str(s).replace("\u2014", "-").replace("\u2013", "-").replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'").encode("latin-1", errors="replace").decode("latin-1")
+
 def render_investigation_pdf(report: dict, out_path: str) -> str:
     """Render investigation report to PDF via fpdf2. Returns out_path."""
     from fpdf import FPDF
-    pdf = FPDF(format="A4")
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    pdf.set_left_margin(10)
+    pdf.set_right_margin(10)
     # Title
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, report.get("title", "Investigation Report"), ln=True, align="C")
+    pdf.cell(0, 10, _safe_pdf(report.get("title", "Investigation Report")), ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6, f"Generated {report.get('generated_at','')} | Investigator {report.get('investigator',{}).get('investigator_version','')}", ln=True, align="C")
@@ -302,29 +309,24 @@ def render_investigation_pdf(report: dict, out_path: str) -> str:
     # Summary box
     inv = report.get("investigator", {})
     amounts = report.get("amounts", {})
-    pdf.set_fill_color(248, 250, 252)
-    pdf.set_draw_color(226, 232, 240)
-    x, y = pdf.get_x(), pdf.get_y()
-    pdf.rect(x, y, 190, 28, style="DF")
-    pdf.set_xy(x + 4, y + 4)
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(0, 6, f"Root cause: {inv.get('root_cause','')}  |  Confidence: {inv.get('confidence',0):.0%}  |  Policy hint: {inv.get('policy_hint','review')}", ln=True)
-    pdf.set_x(x + 4)
+    pdf.set_fill_color(248, 250, 252)
+    pdf.cell(0, 7, _safe_pdf(f"Root cause: {inv.get('root_cause','')}  |  Confidence: {inv.get('confidence',0):.0%}  |  Policy: {inv.get('policy_hint','review')}"), ln=True, fill=True)
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, f"Expected Rs {amounts.get('expected_net','')}  Settled Rs {amounts.get('settled','')}  Diff Rs {amounts.get('diff','')}  Gap {amounts.get('gap_rate',0):.2%}", ln=True)
-    pdf.set_x(x + 4)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.cell(0, 6, _safe_pdf(f"Expected Rs {amounts.get('expected_net','')}  Settled Rs {amounts.get('settled','')}  Diff Rs {amounts.get('diff','')}  Gap {amounts.get('gap_rate',0):.2%}"), ln=True)
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(80, 80, 80)
-    pdf.cell(0, 5, f"Recommended: {inv.get('recommended_next_step','')}", ln=True)
+    pdf.multi_cell(0, 5, _safe_pdf(f"Recommended: {inv.get('recommended_next_step','')}"))
     pdf.set_text_color(0, 0, 0)
-    pdf.ln(6)
+    pdf.ln(3)
     # Evidence
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 7, "Evidence", ln=True)
     pdf.set_font("Helvetica", "", 9)
     for ev in inv.get("evidence", [])[:8]:
-        pdf.cell(5, 5, chr(8226))
-        pdf.multi_cell(0, 5, ev)
+        pdf.set_x(10)
+        pdf.multi_cell(0, 5, _safe_pdf("- " + ev))
     pdf.ln(3)
     # Supporting evidence table
     pdf.set_font("Helvetica", "B", 11)
@@ -336,9 +338,9 @@ def render_investigation_pdf(report: dict, out_path: str) -> str:
     pdf.cell(110, 6, "Fact", border=1, fill=True, ln=True)
     pdf.set_font("Helvetica", "", 8)
     for se in inv.get("supporting_evidence", [])[:10]:
-        pdf.cell(35, 6, str(se.get("source",""))[:18], border=1)
-        pdf.cell(45, 6, str(se.get("record",""))[:24], border=1)
-        pdf.cell(110, 6, str(se.get("fact",""))[:58], border=1, ln=True)
+        pdf.cell(35, 6, _safe_pdf(str(se.get("source",""))[:18]), border=1)
+        pdf.cell(45, 6, _safe_pdf(str(se.get("record",""))[:24]), border=1)
+        pdf.cell(110, 6, _safe_pdf(str(se.get("fact",""))[:58]), border=1, ln=True)
     pdf.ln(3)
     # Alternative + missing
     pdf.set_font("Helvetica", "B", 10)
@@ -346,24 +348,24 @@ def render_investigation_pdf(report: dict, out_path: str) -> str:
     pdf.set_font("Helvetica", "", 9)
     for h in inv.get("alternative_hypotheses", [])[:5]:
         pdf.cell(5, 5, "-")
-        pdf.cell(0, 5, h, ln=True)
+        pdf.cell(0, 5, _safe_pdf(h), ln=True)
     pdf.ln(2)
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(0, 6, "Missing Evidence (would raise confidence)", ln=True)
     pdf.set_font("Helvetica", "", 9)
     for m in inv.get("missing_evidence", [])[:5]:
         pdf.cell(5, 5, "-")
-        pdf.cell(0, 5, m, ln=True)
+        pdf.cell(0, 5, _safe_pdf(m), ln=True)
     pdf.ln(4)
     # Audit trail snippet
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(0, 6, "Audit Trail (for this order)", ln=True)
     pdf.set_font("Helvetica", "", 8)
     for ae in report.get("audit_entries", [])[:6]:
-        pdf.cell(0, 5, f"{ae.get('created_at','')}  {ae.get('outcome','')}  {ae.get('reason','')}  {ae.get('classification','')}  {str(ae.get('audit_note',''))[:80]}", ln=True)
+        pdf.cell(0, 5, _safe_pdf(f"{ae.get('created_at','')}  {ae.get('outcome','')}  {ae.get('reason','')}  {ae.get('classification','')}  {str(ae.get('audit_note',''))[:80]}"), ln=True)
     pdf.ln(4)
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(100, 100, 100)
-    pdf.multi_cell(0, 5, "Human approval required: Yes — AI cannot change the ledger or execute the decision. Deterministic policy decides, human has final authority.")
+    pdf.multi_cell(0, 5, _safe_pdf("Human approval required: Yes - AI cannot change the ledger or execute the decision. Deterministic policy decides, human has final authority."))
     pdf.output(out_path)
     return out_path

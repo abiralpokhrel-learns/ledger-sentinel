@@ -8,7 +8,6 @@ real submission should have the key set.
 """
 from __future__ import annotations
 
-import os
 import re
 
 from app.config import anthropic_api_key, anthropic_model

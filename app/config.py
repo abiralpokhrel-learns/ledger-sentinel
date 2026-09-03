@@ -68,6 +68,7 @@ def is_strict() -> bool:
 # --- reconciliation constants ----------------------------------------------
 
 # Never compare money with strict equality. ₹0.01 covers rounding noise.
+# Kept for backwards compat; use tolerance() for env-overrideable value.
 TOLERANCE = 0.01
 
 # Expected withholding band for the AI classifier to recognise as TDS/TCS.
@@ -75,3 +76,6 @@ TOLERANCE = 0.01
 # clean match is treated as a candidate "expected_tds_withholding".
 TDS_RATE = 0.02  # 2% — representative TDS/TCS-shaped deduction
 TDS_BAND = 0.005  # +/- 0.5pp slack around the nominal rate
+
+# Re-export for tests that import TOLERANCE directly
+__all__ = ["webhook_secret", "db_path", "anthropic_api_key", "anthropic_model", "mcp_mode", "tolerance", "is_strict", "TOLERANCE", "TDS_RATE", "TDS_BAND"]

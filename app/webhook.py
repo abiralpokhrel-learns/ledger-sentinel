@@ -17,13 +17,16 @@ import hashlib
 import hmac
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import APIRouter, FastAPI, Request, HTTPException
 from pydantic import BaseModel, field_validator
 
 from app import db
 from app.config import webhook_secret
 
+router = APIRouter()
+# Keep `app` for standalone `uvicorn app.webhook:app` and legacy imports; main app uses `router`
 app = FastAPI(title="Ledger Sentinel Webhook")
+app.include_router(router)
 
 # Rank defines the only legal direction of travel for an order's state.
 STATE_RANK = {
@@ -123,7 +126,7 @@ def try_record_event(conn, event_id, order_id, event_type) -> str:
 MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB — Razorpay payloads are small; block DoS
 
 
-@app.post("/webhook")
+@router.post("/webhook")
 async def razorpay_webhook(request: Request):
     raw_body = await request.body()  # MUST be raw bytes, parsed only after verify
     if len(raw_body) > MAX_BODY_BYTES:

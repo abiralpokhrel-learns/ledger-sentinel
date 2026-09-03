@@ -16,8 +16,6 @@ import argparse
 import contextlib
 import json
 import logging
-import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -32,10 +30,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 log = logging.getLogger("ledger_sentinel")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-
-app = FastAPI(title="Ledger Sentinel")
-# Mount the webhook routes.
-app.include_router(webhook.app.router)
 
 
 @contextlib.asynccontextmanager
@@ -57,27 +51,9 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app.router.lifespan_context = lifespan
-
-# Keep deprecated handlers for backwards compat (tests that use TestClient without lifespan)
-@app.on_event("startup")
-def _startup_compat():
-    if getattr(app.state, "db", None) is None:
-        try:
-            conn = db.get_connection(db_path())
-            db.init_db(conn)
-            app.state.db = conn
-        except Exception as e:
-            log.warning("compat startup DB failed: %s", e)
-
-
-@app.on_event("shutdown")
-def _shutdown_compat():
-    try:
-        if getattr(app.state, "db", None) is not None:
-            app.state.db.close()
-    except Exception:
-        pass
+app = FastAPI(title="Ledger Sentinel", lifespan=lifespan)
+# Mount the webhook routes via router (not the full FastAPI app)
+app.include_router(webhook.router)
 
 
 def _load_orders(conn, data_dir: Path):
@@ -94,19 +70,30 @@ def _load_orders(conn, data_dir: Path):
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"orders.csv missing columns {missing}, got {list(df.columns)}")
+    rows = []
     for _, r in df.iterrows():
         try:
-            # Initialise with status=None; the webhook event stream sets the real
-            # state, so the state machine is actually exercised (not pre-filled).
-            db.upsert_order(
-                conn, str(r["order_id"]), float(r["amount"]),
-                float(r["mdr"]) if pd.notna(r.get("mdr", 0)) else 0.0,
-                float(r["gst"]) if pd.notna(r.get("gst", 0)) else 0.0,
-                r.get("category"), None,
-            )
+            rows.append({
+                "order_id": str(r["order_id"]),
+                "amount": float(r["amount"]),
+                "mdr": float(r["mdr"]) if pd.notna(r.get("mdr", 0)) else 0.0,
+                "gst": float(r["gst"]) if pd.notna(r.get("gst", 0)) else 0.0,
+                "category": r.get("category"),
+                "status": None,  # webhook stream sets real state
+            })
         except Exception as e:
             log.warning("skipping bad order row %s: %s", r.get("order_id"), e)
             continue
+    # Batch insert in single transaction — 10x faster for 10k rows
+    try:
+        db.upsert_orders_batch(conn, rows)
+    except Exception as e:
+        log.warning("batch orders failed, falling back to row-by-row: %s", e)
+        for r in rows:
+            try:
+                db.upsert_order(conn, r["order_id"], r["amount"], r["mdr"], r["gst"], r["category"], r["status"])
+            except Exception as e2:
+                log.warning("skipping row %s: %s", r["order_id"], e2)
 
 
 def _process_webhook_events(conn, data_dir: Path, secret: str):
@@ -176,15 +163,32 @@ def _load_settlement(conn, data_dir: Path):
         raise
     if "order_id" not in df.columns or "amount_settled" not in df.columns:
         raise ValueError(f"settlement.csv missing required columns, got {list(df.columns)}")
+    # Batch settlement inserts
+    s_rows = []
     for _, r in df.iterrows():
         try:
-            db.upsert_settlement(
-                conn, str(r["order_id"]), float(r["amount_settled"]),
-                str(r.get("settlement_status", "")), str(r.get("utr", "")), str(r.get("settlement_date", "")),
-            )
+            s_rows.append((str(r["order_id"]), float(r["amount_settled"]), str(r.get("settlement_status", "")), str(r.get("utr", "")), str(r.get("settlement_date", ""))))
         except Exception as e:
             log.warning("skipping bad settlement row %s: %s", r.get("order_id"), e)
             continue
+    try:
+        conn.executemany(
+            """INSERT INTO settlement (order_id, amount_settled, settlement_status, utr, settlement_date)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(order_id) DO UPDATE SET
+                 amount_settled=excluded.amount_settled,
+                 settlement_status=excluded.settlement_status,
+                 utr=excluded.utr,
+                 settlement_date=excluded.settlement_date""",
+            s_rows,
+        )
+    except Exception as e:
+        log.warning("batch settlement failed, falling back row-by-row: %s", e)
+        for oid, amt, st, utr, dt in s_rows:
+            try:
+                db.upsert_settlement(conn, oid, amt, st, utr, dt)
+            except Exception as e2:
+                log.warning("skipping settlement %s: %s", oid, e2)
 
 
 def run_pipeline(conn, data_dir: Path = DATA_DIR, fresh: bool = True) -> dict:
@@ -242,11 +246,10 @@ def health():
 
 @app.post("/run-pipeline")
 def run_pipeline_endpoint(fresh: bool = True):
+    conn = db.get_connection(db_path())
+    db.init_db(conn)
     try:
-        conn = db.get_connection(db_path())
-        db.init_db(conn)
         summary = run_pipeline(conn, fresh=fresh)
-        conn.close()
         return summary
     except FileNotFoundError as e:
         from fastapi import HTTPException
@@ -255,13 +258,18 @@ def run_pipeline_endpoint(fresh: bool = True):
         log.exception("run-pipeline failed")
         from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=f"pipeline failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run Ledger Sentinel pipeline")
     parser.add_argument(
-        "--db", default=db_path(),
-        help="SQLite database path (default: from LEDGER_DB_PATH env)",
+        "--db", default=None,
+        help="SQLite database path (default: from LEDGER_DB_PATH env or ledger_sentinel.db)",
     )
     parser.add_argument(
         "--no-fresh", action="store_true",
@@ -272,13 +280,14 @@ def main():
         help="Only clear the DB and exit (alternative to rm on Windows)",
     )
     args = parser.parse_args()
-
-    conn = db.get_connection(args.db)
+    # Resolve db path lazily so LEDGER_DB_PATH env is read at call time, not import time
+    db_file = args.db or db_path()
+    conn = db.get_connection(db_file)
     db.init_db(conn)
     if args.clear_only:
         db.clear_all(conn)
         conn.close()
-        print(f"Cleared {args.db} (tables + audit_log). No file delete needed.")
+        print(f"Cleared {db_file} (tables + audit_log). No file delete needed.")
         return
     print("Running Ledger Sentinel pipeline on synthetic batch...\n")
     summary = run_pipeline(conn, DATA_DIR, fresh=not args.no_fresh)

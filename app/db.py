@@ -101,6 +101,9 @@ def clear_all(conn: sqlite3.Connection) -> None:
 # --- orders -----------------------------------------------------------------
 
 def upsert_order(conn, order_id, amount, mdr=0.0, gst=0.0, category=None, status=None):
+    # Preserve existing status when caller passes None (used by pipeline's
+    # _load_orders which wants to exercise the state machine, not pre-fill status).
+    # This prevents a `fresh=False` re-run from wiping webhook-derived status.
     conn.execute(
         """
         INSERT INTO orders (order_id, amount, mdr, gst, category, status)
@@ -110,9 +113,29 @@ def upsert_order(conn, order_id, amount, mdr=0.0, gst=0.0, category=None, status
             mdr=excluded.mdr,
             gst=excluded.gst,
             category=excluded.category,
-            status=excluded.status
+            status=COALESCE(excluded.status, orders.status)
         """,
         (order_id, amount, mdr, gst, category, status),
+    )
+
+
+def upsert_orders_batch(conn, rows: list[dict]) -> None:
+    """Batch version for _load_orders — single transaction, far faster for 10k+ rows."""
+    if not rows:
+        return
+    data = [(r["order_id"], r["amount"], r["mdr"], r["gst"], r["category"], r.get("status")) for r in rows]
+    conn.executemany(
+        """
+        INSERT INTO orders (order_id, amount, mdr, gst, category, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(order_id) DO UPDATE SET
+            amount=excluded.amount,
+            mdr=excluded.mdr,
+            gst=excluded.gst,
+            category=excluded.category,
+            status=COALESCE(excluded.status, orders.status)
+        """,
+        data,
     )
 
 

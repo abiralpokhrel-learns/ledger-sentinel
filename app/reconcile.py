@@ -113,10 +113,14 @@ def summarize(matched: pd.DataFrame, exceptions: pd.DataFrame) -> dict:
     """Human-friendly match-rate summary for the dashboard / README."""
     total = len(matched) + len(exceptions)
     match_rate = (len(matched) / total * 100) if total else 0.0
+    # Sort by_reason for deterministic output (stable across pandas versions)
+    by_reason = {}
+    if not exceptions.empty and "reason" in exceptions.columns:
+        by_reason = exceptions["reason"].value_counts().sort_index().to_dict()
     return {
         "total_rows": total,
         "matched": len(matched),
         "exceptions": len(exceptions),
         "match_rate_pct": round(match_rate, 1),
-        "by_reason": exceptions["reason"].value_counts().to_dict(),
+        "by_reason": by_reason,
     }

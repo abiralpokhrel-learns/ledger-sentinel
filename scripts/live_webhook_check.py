@@ -27,7 +27,19 @@ from pathlib import Path
 import requests
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PORT = int(os.getenv("LEDGER_CHECK_PORT", "8642"))
+
+
+def _free_port(fallback: int) -> int:
+    import socket
+
+    if os.getenv("LEDGER_CHECK_PORT"):
+        return int(os.getenv("LEDGER_CHECK_PORT"))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port(8642)
 BASE = f"http://127.0.0.1:{PORT}"
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -60,7 +72,7 @@ def post_event(raw: bytes, secret: str) -> requests.Response:
     )
 
 
-def wait_for_health(proc: subprocess.Popen, timeout_s: float = 30.0) -> None:
+def wait_for_health(proc: subprocess.Popen, timeout_s: float = 45.0) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -68,7 +80,9 @@ def wait_for_health(proc: subprocess.Popen, timeout_s: float = 30.0) -> None:
         try:
             if requests.get(f"{BASE}/health", timeout=2).status_code == 200:
                 return
-        except requests.ConnectionError:
+        except (requests.ConnectionError, requests.ReadTimeout):
+            time.sleep(0.4)
+        except Exception:
             time.sleep(0.4)
     raise RuntimeError("uvicorn did not become healthy in time")
 

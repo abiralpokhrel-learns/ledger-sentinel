@@ -548,17 +548,25 @@ We disclose simplifications so judges can evaluate credibility:
 ## Docs & Troubleshooting
 
 - `docs/dev-log.md` — real bug (0% match) and how audit_log found it
-- - `docs/demo.gif` — hero visual (pipeline + dashboard walkthrough) (regenerate: `python scripts/generate_demo_gif.py`)
+- `docs/demo.gif` — hero visual (pipeline + dashboard walkthrough) — regenerate: `python scripts/generate_demo_gif.py`
 - `data/generate_synthetic_data.py` — deterministic Faker plan (documented planted inventory)
 
-**`Failed to fetch: https://github.com/.../tree/main/app`** — that URL is HTML, not a raw file. Use:
+**`Failed to fetch: https://github.com/.../blob/main/app/webhook.py` or `/tree/main/app`** — those URLs are GitHub **HTML pages**, not raw files. Browsers block `fetch()` on them (CORS/CSP). Use one of these instead:
 
 ```bash
+# Option 1 — clone the repo (recommended)
 git clone https://github.com/abiralpokhrel-learns/ledger-sentinel.git
 cd ledger-sentinel
+ls app/   # should list 12 files: webhook.py, main.py, db.py, ...
 ```
 
-or `https://raw.githubusercontent.com/abiralpokhrel-learns/ledger-sentinel/main/app/main.py` for raw files. `ls app/` should list 12 files.
+```bash
+# Option 2 — fetch a single file as raw text (for tools/scripts)
+curl https://raw.githubusercontent.com/abiralpokhrel-learns/ledger-sentinel/main/app/webhook.py
+# or in JS: fetch("https://raw.githubusercontent.com/abiralpokhrel-learns/ledger-sentinel/main/app/webhook.py")
+```
+
+> Tip: every `github.com/.../blob/main/...` link has a matching `raw.githubusercontent.com/.../main/...` link — just replace `github.com` + `/blob` with `raw.githubusercontent.com` and it will fetch as `text/plain`.
 
 **Port in use** — set `LEDGER_DASHBOARD_PORT` / `LEDGER_CHECK_PORT`.
 

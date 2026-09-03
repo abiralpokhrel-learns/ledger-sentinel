@@ -1,4 +1,9 @@
-"""Render docs/architecture.png — the diagram used in the README.
+"""Render docs/architecture.png — now delegates to generate_architecture_clean.py for crisp output.
+
+    pip install Pillow
+    python scripts/generate_architecture_clean.py  # preferred, crisp
+    python scripts/generate_architecture.py        # legacy matplotlib
+ — the diagram used in the README.
 
     pip install matplotlib   # docs-only dependency, not in requirements.txt
     python scripts/generate_architecture.py

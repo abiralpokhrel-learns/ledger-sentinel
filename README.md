@@ -12,8 +12,9 @@ Ledger Sentinel reconciles *what you sold* against *what Razorpay actually settl
 
 ## Table of Contents
 
-- [The Problem](#the-problem)
-- [Solution Overview](#solution-overview)
+- [What is this? (Plain English)](#what-is-this--in-simple-words)
+- [The Real Problem](#the-real-problem-why-this-matters)
+- [Solution Overview](#solution-overview--how-it-works-step-by-step)
 - [Architecture — Deterministic First, AI Last](#architecture--deterministic-first-ai-last)
 - [Key Features](#key-features)
 - [Deep Dive — Cost-Sensitive Detection (25x FN)](#deep-dive--cost-sensitive-detection-25x-fn)
@@ -33,32 +34,55 @@ Ledger Sentinel reconciles *what you sold* against *what Razorpay actually settl
 
 ---
 
-## The Problem
+## What is this? — In Simple Words
 
-Every month, a Razorpay merchant has two lists:
+Think of a shop that takes payments with Razorpay.
 
-1. **Orders** — what they sold (amount, MDR, GST, category, status)
-2. **Settlement** — what Razorpay actually paid out (UTR, settlement_status, amount_settled)
+At the end of the month the shop has **two lists**:
 
-Finance teams match these row-by-row in spreadsheets. On the first pass only ~50% matches cleanly. The rest — TDS deductions, late authorization flips, rounding noise, missing rows, batched payouts — requires judgment. It is slow, error-prone, and expensive.
+- **List A — What the shop sold** (each order and its price)
+- **List B — What arrived in the bank** (what Razorpay actually paid out)
+
+Someone has to check, line by line, that every sale in List A has a matching payment in List B. This is called **reconciliation**. Done by hand in Excel, it is slow and mistakes happen. In practice only about **half** the lines match at first glance.
+
+**Ledger Sentinel does this check for you.**
+
+- If the numbers match (even with tiny rounding), it marks the line **green — done**.
+- If they do not match, it puts the line in a **to-check list** and writes a short note in plain English, like:
+  - "This looks like a tax cut — likely okay."
+  - "Payment shows as failed but money still came — late update."
+  - "Big gap — a person should look at this."
+
+That is it. **Green means done. Orange means look.** Every line is saved, nothing is hidden.
+
+> A note on words: above we used only simple words. From here on we use the real technical names so developers and judges can verify exactly how it works.
+
+---
+
+## The Real Problem (Why This Matters)
+
+The simple story above is the day-to-day view. Behind it:
+
+- **Orders** carry `amount`, `MDR` (Razorpay fee), `GST` (tax), `category`, `status`.
+- **Settlement** carries `amount_settled`, `settlement_status`, `UTR` (bank reference), `settlement_date`.
+
+Matching must handle TDS deductions, late authorization flips, rounding noise, missing rows, and batched payouts (many orders in one bank credit). Done by hand it is slow, error-prone, and expensive.
 
 This is not an invented hackathon problem. Razorpay's own careers page lists *automated reconciliation* alongside agentic payments and fraud detection as areas they are embedding AI into. Reconciliation is also a proven SaaS category (BlackLine, FloQast, Tipalti) — the win condition is execution and trust, not novelty.
 
 ---
 
-## Solution Overview
+## Solution Overview — How It Works (Step by Step)
 
-Ledger Sentinel does the matching automatically in 3 stages:
+| Step | Plain meaning | Technical detail | Uses AI? |
+|------|---------------|------------------|----------|
+| **1. Listen** | "Is this message real, and have we seen it before?" | Verifies webhook signature (HMAC-SHA256 on raw bytes), enforces idempotency, applies forward-only state machine | No — exact rules |
+| **2. Match** | "Does the expected money equal the actual money?" | Compares `net_expected = amount - MDR - GST` vs `amount_settled` with tolerance `Rs 0.01`; checks status consistency | No — exact math |
+| **3. Explain** | "Why did this one not match?" | Only exceptions reach AI (Claude or heuristic). One-line note per exception | Yes — only here |
+| **4. Decide** | "What should we do with this?" | Deterministic policy maps signals to `approve | step_up | review | block` | No — fixed rules |
+| **5. Defend** | "Is this a real spike, and what is the proof pack?" | Cost-sensitive rolling-window spike detector + chargeback evidence compiler (drafts only) | Signals only |
 
-| Stage | What happens | AI? |
-|-------|--------------|-----|
-| **1. Listen** | Verifies Razorpay webhook signatures (HMAC-SHA256 on raw bytes), enforces idempotency, applies a forward-only state machine | No — exact |
-| **2. Match** | Compares `net_expected = amount - MDR - GST` vs `amount_settled` with tolerance `Rs 0.01`; checks status consistency | No — exact |
-| **3. Explain** | Only exceptions reach AI (Claude or heuristic). One-line plain-English note per exception | Yes — only here |
-| **4. Decide** | Deterministic policy engine maps signals → `approve | step_up | review | block` | No — exact |
-| **5. Defend** | Cost-sensitive spike detector + chargeback pack compiler (drafts only) | Signals only |
-
-> **Core thesis:** Every row that can be checked exactly *is* checked exactly. The one component that could hallucinate can never silently close a row — it only writes an advisory `classification + audit_note` that the policy engine may escalate to `review`.
+> Core idea: Everything that can be checked for sure *is* checked for sure. AI only explains the few lines where a human would have to guess — and even then it only writes a note. A separate, fixed policy decides what happens next.
 
 ---
 
@@ -99,7 +123,9 @@ Razorpay webhook (raw bytes)
    Dashboard + PDF + /metrics/honest (held-out, FP rupee cost)
 ```
 
-![Architecture](docs/architecture.png)
+![Architecture — Clean flow: deterministic spine, AI only on residue, defense layer](docs/architecture.png)
+
+*New clean diagram (Pillow, no AI artifacts) — regenerate with `python scripts/generate_architecture_clean.py`. If words ever look blurry, re-run that script.*
 
 **Invariants:** No `DELETE FROM` of DB files needed (`clear_all` is Windows-safe). Re-runs are idempotent. Every outcome — `applied`, `duplicate_skipped`, `rejected`, `matched`, `exception` — has an `audit_log` row.
 

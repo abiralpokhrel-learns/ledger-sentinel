@@ -17,6 +17,6 @@ jobs:
           cache: "pip"
       - run: pip install -r requirements.txt
       - run: pip install pytest
-      - run: pytest tests/ -q
       - run: python data/generate_synthetic_data.py
       - run: python -m app.main
+      - run: pytest tests/ -q

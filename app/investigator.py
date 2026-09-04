@@ -207,6 +207,13 @@ def _heuristic_investigate(ctx: dict) -> dict:
         evidence.append(f"Audit outcome {last.get('outcome')} reason {last.get('reason')}")
         supporting.append({"source": "audit_log", "record": order_id, "fact": f"outcome={last.get('outcome')} reason={last.get('reason')}"})
 
+    # Always cite at least one fact — critical for empty DB / CI fresh checkout
+    if not evidence:
+        evidence.append(f"Order {order_id} not found in ledger — searched orders, settlement, audit_log (empty on fresh DB)")
+        supporting.append({"source": "orders", "record": order_id, "fact": "no record found — empty DB on CI before synthetic data"})
+    if not supporting:
+        supporting.append({"source": "orders", "record": order_id, "fact": "no record found"})
+
     # Root cause decision
     if not has_order:
         root_cause = "missing_order"

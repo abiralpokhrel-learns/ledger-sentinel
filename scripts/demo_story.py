@@ -35,9 +35,12 @@ ORDERS = [
     dict(order_id="demo_007", amount=12000.00, mdr=240.00, gst=43.20, category="software", status="captured", note="status mismatch"),
     # 8 suspicious spike candidate — large unexplained gap
     dict(order_id="demo_008", amount=20000.00, mdr=400.00, gst=72.00, category="consulting", status="captured", note="large gap — review"),
-    # 9 batched settlement — 2 orders share one UTR
-    dict(order_id="demo_009", amount=7000.00, mdr=140.00, gst=25.20, category="food", status="captured", note="batched A (UTR_BATCH_1)"),
-    dict(order_id="demo_010", amount=9000.00, mdr=180.00, gst=32.40, category="food", status="captured", note="batched B (UTR_BATCH_1)"),
+    # 9 batched settlement — 2 orders share one UTR (already 1:1 matched — display only)
+    dict(order_id="demo_009", amount=7000.00, mdr=140.00, gst=25.20, category="food", status="captured", note="batched A (UTR_BATCH_1) — display"),
+    dict(order_id="demo_010", amount=9000.00, mdr=180.00, gst=32.40, category="food", status="captured", note="batched B (UTR_BATCH_1) — display"),
+    # 11 + 12 true batched recovery — zero individual settlement rows, only one aggregated UTR_BATCH_2 credit
+    dict(order_id="demo_011", amount=6000.00, mdr=120.00, gst=21.60, category="food", status="captured", note="batched recovery A (UTR_BATCH_2)"),
+    dict(order_id="demo_012", amount=11000.00, mdr=220.00, gst=39.60, category="food", status="captured", note="batched recovery B (UTR_BATCH_2)"),
 ]
 
 SETTLEMENT = [
@@ -49,9 +52,12 @@ SETTLEMENT = [
     dict(order_id="demo_006", amount_settled=4882.00, settlement_status="captured", utr="UTR_DEMO_006", settlement_date="2026-08-12"),  # orphan — no order_006
     dict(order_id="demo_007", amount_settled=11716.80, settlement_status="failed", utr="UTR_DEMO_007", settlement_date="2026-08-12"),  # status mismatch: captured vs failed
     dict(order_id="demo_008", amount_settled=18000.00, settlement_status="captured", utr="UTR_DEMO_008", settlement_date="2026-08-12"),  # large gap
-    # batched: two orders, one UTR, one settlement sum
+    # batched display: two orders, one UTR, two rows (already matched 1:1 — just decorates)
     dict(order_id="demo_009", amount_settled=6834.80, settlement_status="captured", utr="UTR_BATCH_1", settlement_date="2026-08-13"),
     dict(order_id="demo_010", amount_settled=8787.60, settlement_status="captured", utr="UTR_BATCH_1", settlement_date="2026-08-13"),
+    # batched recovery: demo_011+demo_012 have ZERO individual rows — only one aggregated credit
+    # expected: demo_011 5858.40 + demo_012 10740.40 = 16598.80 — single UTR_BATCH_2 row recovers both
+    dict(order_id="BATCH_UTR_BATCH_2", amount_settled=16598.80, settlement_status="captured", utr="UTR_BATCH_2", settlement_date="2026-08-13", batched_order_ids="demo_011,demo_012"),
 ]
 
 # For batched demo: also provide aggregated settlement view (one row per UTR)
@@ -87,14 +93,16 @@ def run_story():
         except Exception:
             pass
 
+    # Filter aggregated BATCH_ placeholder from display — it's a settlement credit, not a real order exception
+    display_exceptions = exceptions[~exceptions["order_id"].astype(str).str.startswith("BATCH_")].copy()
     # Pretty print story
-    print("\nLedger Sentinel — 10-Order Beautiful Story")
+    print("\nLedger Sentinel — 12-Order Beautiful Story (10 + 2 batched recovery)")
     print("=" * 60)
-    print(f"Orders: {len(orders)}  Settlement rows: {len(settlement)}")
-    print(f"Matched: {len(matched)}  Exceptions: {len(exceptions)}  Rate: {summary['match_rate_pct']}%")
+    print(f"Orders: {len(orders)}  Settlement rows: {len(settlement)}  (incl. 1 aggregated batch credit)")
+    print(f"Matched (1:1): {len(matched)}  Exceptions (1:1): {len(display_exceptions)}  Rate: {summary['match_rate_pct']}%")
     print(f"By reason: {summary['by_reason']}")
     print("-" * 60)
-    for _, r in exceptions.sort_values("order_id").iterrows():
+    for _, r in display_exceptions.sort_values("order_id").iterrows():
         oid = r["order_id"]
         calc = r.get("amount_calc", r.get("amount", ""))
         sett = r.get("amount_settled", "")
@@ -115,11 +123,13 @@ def run_story():
         from app.reconcile_batched import group_by_utr, reconcile_batched
         grouped = group_by_utr(settlement)
         batched = grouped[grouped["count"] > 1]
-        print(f"\nBatched groups: {len(batched)}  (UTR_BATCH_1 has 2 orders → one bank credit)")
+        print(f"\nBatched groups (display): {len(batched)}  (UTR_BATCH_1 has 2 orders → one bank credit)")
         if not batched.empty:
             print(batched.to_string(index=False))
         rb = reconcile_batched(orders, settlement)
-        print(f"Batched summary: {rb['summary']}")
+        print(f"\nBatched recovery: {rb['summary']['batched_recovered']} orders recovered via aggregated UTR (demo_011+demo_012 → UTR_BATCH_2 Rs 16,598.80)")
+        print(f"Batched summary: matched {rb['summary']['matched']}/{rb['summary']['total_rows']} ({rb['summary']['match_rate_pct']}%) — 1:1 was {rb['summary']['1to1_summary']['matched']}/{rb['summary']['1to1_summary']['total_rows']} ({rb['summary']['1to1_summary']['match_rate_pct']}%)")
+        print(f"Recovered: {rb['summary'].get('batched_recovered_ids', [])} — still missing: {[r for r in rb['still_exceptions']['order_id'].tolist() if not str(r).startswith('BATCH_')][:5]}")
     except Exception as e:
         print(f"Batched demo skipped: {e}")
 

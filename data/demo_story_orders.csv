@@ -6,5 +6,7 @@ demo_004,15000.0,300.0,54.0,food,failed,late auth flip
 demo_005,8000.0,160.0,28.8,consulting,captured,missing settlement
 demo_007,12000.0,240.0,43.2,software,captured,status mismatch
 demo_008,20000.0,400.0,72.0,consulting,captured,large gap — review
-demo_009,7000.0,140.0,25.2,food,captured,batched A (UTR_BATCH_1)
-demo_010,9000.0,180.0,32.4,food,captured,batched B (UTR_BATCH_1)
+demo_009,7000.0,140.0,25.2,food,captured,batched A (UTR_BATCH_1) — display
+demo_010,9000.0,180.0,32.4,food,captured,batched B (UTR_BATCH_1) — display
+demo_011,6000.0,120.0,21.6,food,captured,batched recovery A (UTR_BATCH_2)
+demo_012,11000.0,220.0,39.6,food,captured,batched recovery B (UTR_BATCH_2)

@@ -338,44 +338,88 @@ def investigate(conn: sqlite3.Connection, order_id: str) -> dict:
 
 
 def investigate_anomaly(conn: sqlite3.Connection, window: str = "1h", spike_threshold_z: float = 2.0) -> dict:
-    """Anomaly investigation — spike → evidence → explanation. Uses detection module."""
+    """Anomaly investigation — spike → evidence → explanation. Delegates to detection.py (single source of truth)."""
     try:
-        from app.detection import CostSensitiveDetector
+        from app.detection import compute_baseline, detect_spikes
         import pandas as pd
-        # Build a synthetic transaction view from audit — for demo we synthesize spike evidence
-        # In production this would read real transaction stream
+
         audit = pd.read_sql_query("SELECT * FROM audit_log", conn)
         total = len(audit)
-        # Heuristic: use recent exceptions as spike proxy
-        recent = audit.tail(20) if total > 20 else audit
-        exc_rate = float((recent["outcome"] == "exception").mean()) if not recent.empty else 0
-        baseline = 0.15
-        z = (exc_rate - baseline) / max(0.05, baseline * 0.3) if baseline else 0
-        is_spike = z >= spike_threshold_z
+        if audit.empty:
+            return {
+                "root_cause": "no_spike",
+                "confidence": 0.9,
+                "evidence": [f"Window {window}: 0 events — no data yet"],
+                "supporting_evidence": [{"source": "audit_log", "record": f"window:{window}", "fact": "empty audit_log"}],
+                "alternative_hypotheses": [],
+                "missing_evidence": ["audit data"],
+                "recommended_next_step": "No action — continue monitoring",
+                "policy_hint": "approve",
+                "window": window, "is_spike": False, "z": 0.0,
+                "investigator_version": INVESTIGATOR_VERSION, "is_heuristic": True,
+            }
+
+        # Build windowed view: treat audit rows as time series (audit has no timestamp column reliably,
+        # so we synthesize windows by slicing the ordered log into pseudo-windows).
+        # Use detection.py's rolling model: create a DataFrame with a synthetic timestamp per row.
+        # For honesty we use the same baseline logic as detection.py — no fixed baseline constant.
+        try:
+            audit["_ts"] = pd.to_datetime(audit.get("created_at"), errors="coerce")
+            # If timestamps missing, synthesize sequential minutes
+            if audit["_ts"].isna().all():
+                audit["_ts"] = pd.date_range("2026-08-10", periods=len(audit), freq="30min")
+        except Exception:
+            audit["_ts"] = pd.date_range("2026-08-10", periods=len(audit), freq="30min")
+        audit["_is_fraud"] = (audit["outcome"] == "exception").astype(int)
+
+        # Reuse detection.py windowing: floor to requested window (1h/6h)
+        tmp = audit.rename(columns={"_is_fraud": "is_fraud", "_ts": "timestamp"})
+        # detection.rolling_window_features expects timestamp col + is_fraud
+        from app.detection import rolling_window_features
+        windows = rolling_window_features(tmp, time_col="timestamp", window=window)
+        if windows.empty or "fraud_rate" not in windows.columns:
+            return {
+                "root_cause": "no_spike", "confidence": 0.9,
+                "evidence": [f"Window {window}: {len(audit)} events — insufficient to window"],
+                "supporting_evidence": [{"source": "audit_log", "record": f"window:{window}", "fact": f"rows={len(audit)}"}],
+                "alternative_hypotheses": [], "missing_evidence": [],
+                "recommended_next_step": "No action — continue monitoring",
+                "policy_hint": "approve", "window": window, "is_spike": False, "z": 0.0,
+                "investigator_version": INVESTIGATOR_VERSION, "is_heuristic": True,
+            }
+
+        # Single source of truth: compute_baseline + detect_spikes from detection.py (mean + k*std)
+        baseline = compute_baseline(windows, rate_col="fraud_rate", k=spike_threshold_z)
+        flagged = detect_spikes(windows, baseline, rate_col="fraud_rate")
+        # Most recent window drives the answer
+        last = flagged.iloc[-1] if len(flagged) else None
+        is_spike = bool(last["is_spike"]) if last is not None and "is_spike" in last else False
+        z = float(last["spike_z"]) if last is not None and "spike_z" in last else 0.0
+        exc_rate = float(last["fraud_rate"]) if last is not None else 0.0
+        baseline_mean = float(baseline.mean)
+        thr = float(baseline.threshold)
+
         evidence = [
-            f"Window {window}: {len(recent)} events, exception rate {exc_rate:.1%} vs baseline {baseline:.1%}",
-            f"Spike z-score {z:.1f} (threshold {spike_threshold_z})",
-            f"Total audit rows {total}",
+            f"Window {window}: {len(audit)} events across {len(windows)} windows, last fraud_rate {exc_rate:.1%}",
+            f"Baseline {baseline_mean:.1%} ± {float(baseline.std):.1%} (n={baseline.count}), threshold {thr:.1%}",
+            f"Last window z-score {z:.1f} (threshold k={spike_threshold_z})",
         ]
         supporting = [
-            {"source": "audit_log", "record": f"window:{window}", "fact": f"exc_rate={exc_rate:.3f}"},
-            {"source": "detection", "record": f"z={z:.1f}", "fact": f"baseline={baseline}, z={z:.1f}"},
+            {"source": "audit_log", "record": f"window:{window}", "fact": f"fraud_rate={exc_rate:.3f}, windows={len(windows)}"},
+            {"source": "detection", "record": f"z={z:.1f}", "fact": f"baseline={baseline_mean:.3f}, std={float(baseline.std):.3f}, threshold={thr:.3f}"},
         ]
         if is_spike:
             return {
                 "root_cause": "suspicious_spike",
-                "confidence": min(0.85, 0.5 + z * 0.1),
-                "evidence": evidence + ["Spike driven by elevated exception rate — differs from normal distribution"],
+                "confidence": min(0.85, 0.5 + max(0, z) * 0.1),
+                "evidence": evidence + ["Spike driven by elevated exception rate — differs from historical baseline"],
                 "supporting_evidence": supporting,
                 "alternative_hypotheses": ["bulk TDS period", "batch settlement delay"],
                 "missing_evidence": ["per-card/IP breakdown for this window", "merchant promotion calendar"],
                 "recommended_next_step": "Step-up verification — request additional authentication for transactions in this window",
                 "policy_hint": "step_up" if z < 4 else "block",
-                "window": window,
-                "is_spike": True,
-                "z": round(z, 2),
-                "investigator_version": INVESTIGATOR_VERSION,
-                "is_heuristic": True,
+                "window": window, "is_spike": True, "z": round(z, 2),
+                "investigator_version": INVESTIGATOR_VERSION, "is_heuristic": True,
             }
         return {
             "root_cause": "no_spike",
@@ -385,12 +429,8 @@ def investigate_anomaly(conn: sqlite3.Connection, window: str = "1h", spike_thre
             "alternative_hypotheses": [],
             "missing_evidence": [],
             "recommended_next_step": "No action — continue monitoring",
-            "policy_hint": "approve",
-            "window": window,
-            "is_spike": False,
-            "z": round(z, 2),
-            "investigator_version": INVESTIGATOR_VERSION,
-            "is_heuristic": True,
+            "policy_hint": "approve", "window": window, "is_spike": False, "z": round(z, 2),
+            "investigator_version": INVESTIGATOR_VERSION, "is_heuristic": True,
         }
     except Exception as e:
         return {

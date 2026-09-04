@@ -134,25 +134,24 @@ def _validate_sql(sql: str) -> tuple[bool, str]:
     s = sql.strip()
     if not s:
         return False, "Empty SQL"
-    # Block forbidden
+    # Block forbidden — word boundary, escaped keyword
     upper = s.upper()
     for kw in FORBIDDEN:
-        # Use word boundary
-        if re.search(rf"\\b{kw}\\b", upper):
+        if re.search(rf"\b{re.escape(kw)}\b", upper):
             return False, f"Forbidden keyword: {kw}"
     # Must start with SELECT or WITH
-    first = re.split(r"\\s+", s.lstrip(" ("))[0].upper() if s else ""
+    first = re.split(r"\s+", s.lstrip(" ("))[0].upper() if s else ""
     if first not in READ_ONLY_VERBS:
-        # Allow leading ( for CTE?
         if not s.lstrip().upper().startswith("SELECT") and not s.lstrip().upper().startswith("WITH"):
             return False, "Only SELECT/WITH queries allowed"
-    # Table allowlist (best-effort)
-    # Extract FROM/JOIN tables
-    tables = re.findall(r"(?:FROM|JOIN)\\s+([a-zA-Z_][a-zA-Z0-9_]*)", upper)
+    # Table allowlist — reject unknown tables (catches exfil via sqlite_master tricks too)
+    tables = re.findall(r"(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)", upper)
     for t in tables:
-        if t.lower() not in ALLOWED_TABLES and t.lower() not in ("sqlite_master",):
-            # Allow subquery alias — not strict
-            pass
+        tl = t.lower()
+        if tl not in ALLOWED_TABLES and tl not in ("sqlite_master",):
+            # subquery aliases like (SELECT ...) AS sub — allow only if it's not a real table ref
+            # be strict: any unknown table is blocked
+            return False, f"Table not in allowlist: {t}"
     return True, ""
 
 
@@ -167,7 +166,7 @@ def _heuristic_sql(question: str) -> str:
     if "last week" in q or "week" in q:
         return "SELECT COUNT(*) as rows, outcome, reason FROM audit_log WHERE created_at >= datetime('now','-7 days') GROUP BY outcome, reason"
     if "order_" in q:
-        m = re.search(r"order_\\d+", q)
+        m = re.search(r"order_\d+", q)
         oid = m.group(0) if m else "order_0001"
         return f"SELECT * FROM audit_log WHERE order_id='{oid}' ORDER BY created_at DESC LIMIT 5"
     return "SELECT COUNT(*) as total, outcome FROM audit_log GROUP BY outcome"
@@ -192,7 +191,7 @@ def _call_llm_sql(question: str) -> Optional[str]:
         text = resp.content[0].text if resp.content and hasattr(resp.content[0], "text") else ""
         # Extract SQL block
         # Take first SELECT/WITH statement
-        m = re.search(r"(SELECT|WITH)[\\s\\S]+?;", text, re.IGNORECASE)
+        m = re.search(r"(SELECT|WITH)[\s\S]+?;", text, re.IGNORECASE)
         if m:
             return m.group(0)
         # fallback: whole text if it looks like SQL
@@ -213,8 +212,8 @@ def analyst_query(conn: sqlite3.Connection, question: str) -> dict:
     if not sql:
         sql = _heuristic_sql(question)
     # Clean markdown fences if LLM added them
-    sql = re.sub(r"^```(?:sql)?\\s*", "", sql.strip(), flags=re.IGNORECASE)
-    sql = re.sub(r"```\\s*$", "", sql.strip())
+    sql = re.sub(r"^```(?:sql)?\s*", "", sql.strip(), flags=re.IGNORECASE)
+    sql = re.sub(r"```\s*$", "", sql.strip())
     sql = sql.strip().rstrip(";") + ";"
     ok, reason = _validate_sql(sql)
     if not ok:

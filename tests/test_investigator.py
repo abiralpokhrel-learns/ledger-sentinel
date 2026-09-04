@@ -89,6 +89,18 @@ def test_analyst_sql_validator():
     assert ok2 is False
     ok3, _ = _validate_sql("INSERT INTO orders VALUES (1)")
     assert ok3 is False
+    # Senior #1 repro — DROP/DELETE after semicolon was previously allowed due to \\b bug
+    ok4, _ = _validate_sql("SELECT * FROM orders; DROP TABLE orders;--")
+    assert ok4 is False
+    ok5, _ = _validate_sql("SELECT * FROM orders WHERE 1=1; DELETE FROM orders;")
+    assert ok5 is False
+    # allowlist — unknown table must be rejected (was pass before)
+    ok6, _ = _validate_sql("SELECT * FROM unknown_table")
+    assert ok6 is False
+    # order_ regex — should pick correct id, not always order_0001
+    from app.clustering_analyst import _heuristic_sql
+    assert "order_0010" in _heuristic_sql("tell me about order_0010")
+    assert "order_0042" in _heuristic_sql("what happened to order_0042 ?")
 
 def test_investigation_report():
     from app.clustering_analyst import build_investigation_report

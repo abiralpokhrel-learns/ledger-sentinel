@@ -34,6 +34,25 @@ from app.webhook import try_record_event, verify_signature
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ledger_sentinel")
 
+# Structured JSON logging for production (enable with LEDGER_JSON_LOGS=1)
+if os.getenv("LEDGER_JSON_LOGS", "").lower() in ("1", "true", "yes"):
+    import json as _json_log
+
+    class JsonFormatter(logging.Formatter):
+        def format(self, record):
+            return _json_log.dumps({
+                "ts": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%SZ"),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+                "request_id": getattr(record, "request_id", "-"),
+            })
+
+    _h = logging.getHandlerClass()(logging.StreamHandler())
+    _h.setFormatter(JsonFormatter())
+    logging.getLogger().handlers = [_h]
+    log.info("JSON logging enabled")
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
@@ -56,9 +75,63 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="Ledger Sentinel", lifespan=lifespan)
+app = FastAPI(title="Ledger Sentinel", version="1.0.0", lifespan=lifespan)
 # Mount the webhook routes via router (not the full FastAPI app)
 app.include_router(webhook.router)
+
+# --- Production middleware: request ID, security headers, CORS ---
+import time
+import uuid
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("LEDGER_CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        request.state.request_id = rid
+        start = time.time()
+        try:
+            response = await call_next(request)
+        except Exception:
+            log.exception("unhandled error rid=%s %s %s", rid, request.method, request.url.path)
+            raise
+        duration_ms = int((time.time() - start) * 1000)
+        response.headers["x-request-id"] = rid
+        response.headers["x-content-type-options"] = "nosniff"
+        response.headers["x-frame-options"] = "DENY"
+        response.headers["referrer-policy"] = "strict-origin-when-cross-origin"
+        log.info("rid=%s %s %s -> %s %dms", rid, request.method, request.url.path, response.status_code, duration_ms)
+        return response
+
+app.add_middleware(RequestIdMiddleware)
+
+# Simple in-memory rate limit (per-IP, best-effort, no Redis) — protects webhook + analyst
+from collections import defaultdict
+import time as _t
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_RATE_LIMIT = int(os.getenv("LEDGER_RATE_LIMIT_PER_MIN", "120"))
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Only limit webhook + analyst + detect to avoid starving dashboard
+    if request.url.path in ("/webhook", "/analyst/query", "/detect"):
+        ip = request.client.host if request.client else "unknown"
+        now = _t.time()
+        window = [t for t in _rate_buckets[ip] if now - t < 60]
+        _rate_buckets[ip] = window
+        if len(window) >= _RATE_LIMIT:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=429, content={"detail": "rate limit exceeded, retry after 60s", "retry_after": 60})
+        window.append(now)
+    return await call_next(request)
 
 
 def _load_orders(conn, data_dir: Path):
@@ -476,6 +549,55 @@ def learning_dataset():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/healthz")
+def healthz():
+    """K8s liveness — no DB."""
+    return {"status": "ok", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    """K8s readiness — checks DB + migrations."""
+    try:
+        conn = db.get_connection(db_path())
+        db.init_db(conn)
+        conn.execute("SELECT 1 FROM audit_log LIMIT 1")
+        conn.close()
+        return {"status": "ready", "db": "ok"}
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"status": "not_ready", "detail": str(e)})
+
+
+@app.get("/metrics")
+def metrics_prom():
+    """Minimal Prometheus-style metrics for uptime/K8s HPA — no external dep."""
+    try:
+        conn = db.get_connection(db_path())
+        db.init_db(conn)
+        audit = db.load_audit_df(conn)
+        conn.close()
+        recon = audit[audit["outcome"].isin(["matched", "exception"])] if not audit.empty and "outcome" in audit.columns else audit
+        matched = int((recon["outcome"] == "matched").sum()) if not recon.empty else 0
+        exceptions = int((recon["outcome"] == "exception").sum()) if not recon.empty else 0
+        lines = [
+            "# HELP ledger_sentinel_matched Total matched rows",
+            "# TYPE ledger_sentinel_matched gauge",
+            f"ledger_sentinel_matched {matched}",
+            "# HELP ledger_sentinel_exceptions Total exception rows",
+            "# TYPE ledger_sentinel_exceptions gauge",
+            f"ledger_sentinel_exceptions {exceptions}",
+            "# HELP ledger_sentinel_audit_rows Total audit rows",
+            "# TYPE ledger_sentinel_audit_rows gauge",
+            f"ledger_sentinel_audit_rows {len(audit)}",
+        ]
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+    except Exception as e:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(f"# error {e}\n", media_type="text/plain; version=0.0.4")
 
 
 @app.get("/stats")

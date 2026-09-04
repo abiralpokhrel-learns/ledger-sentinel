@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+.env
+ledger_sentinel.db*
+*.db
+*.db-wal
+*.db-shm
+.git
+.gitignore
+docs/
+.pytest_cache
+.mypy_cache
+.ruff_cache

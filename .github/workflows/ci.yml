@@ -16,7 +16,11 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
-      - run: pip install pytest
+      - run: pip install pytest ruff
+      - run: ruff check app/ tests/ || true
       - run: python data/generate_synthetic_data.py
       - run: python -m app.main
       - run: pytest tests/ -q
+      - run: python -m py_compile app/main.py dashboard/app.py
+      - name: docker build smoke
+        run: docker build -t ledger-sentinel:ci .

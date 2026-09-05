@@ -15,7 +15,12 @@ Professional, demo-ready. One screen with:
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
+
+# Streamlit adds the script dir to sys.path first — with '' leading, `import app` finds
+# dashboard/app.py (file) instead of the app/ package. Force /app to front.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 import streamlit as st

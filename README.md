@@ -4,7 +4,7 @@
 
 **Razorpay AI Buildathon 2026 — Track 04: AI Finance Controller + Track 02: AI Defense**
 
-[![CI](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) [![Tests 30 passed](https://img.shields.io/badge/tests-30%20passed-brightgreen)](#testing)
+[![CI](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/abiralpokhrel-learns/ledger-sentinel/actions) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) [![Tests 43 passed](https://img.shields.io/badge/tests-43%20passed-brightgreen)](#testing) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://github.com/abiralpokhrel-learns/ledger-sentinel/pkgs/container/ledger-sentinel)
 
 > **Razorpay merchants shouldn't need spreadsheets to reconcile payments.**
 >
@@ -433,32 +433,35 @@ streamlit run dashboard/app.py   # → http://localhost:8501
 
 Requires Python 3.11+.
 
+**Local (no Docker):**
 ```bash
-# 1. Install
 git clone https://github.com/abiralpokhrel-learns/ledger-sentinel.git
 cd ledger-sentinel
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Mac/Linux:
-# source .venv/bin/activate
-
+# Windows: .venv\Scripts\activate
+# Mac/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-
-# 2. Run (works out of the box — no keys needed)
 python data/generate_synthetic_data.py
-python -m app.main
-
-# 3. Dashboard
+python -m app.main          # 61 → 49 matched / 12 exceptions / 80.3%
 streamlit run dashboard/app.py
-
-# 4. APIs (in another terminal)
-uvicorn app.main:app --reload
-curl http://localhost:8000/health
-curl http://localhost:8000/stats
-curl http://localhost:8000/metrics/honest
-curl http://localhost:8000/chargeback/order_0005
+uvicorn app.main:app --reload   # separate terminal
 ```
+
+**Docker (recommended for demos / production):**
+```bash
+cp .env.example .env   # set ANTHROPIC_API_KEY for AI, else heuristic fallback
+make docker-build      # or: docker build -t ledger-sentinel:local .
+make docker-run        # or: docker run --rm -p 8000:8000 -p 8501:8501 ledger-sentinel:local
+docker exec ledger-sentinel python data/generate_synthetic_data.py
+docker exec ledger-sentinel python -m app.main
+curl http://localhost:8000/healthz
+curl http://localhost:8000/stats
+# full stack:
+docker compose up -d --build   # api :8000 + dashboard :8501
+# see docs/production.md for healthz/readyz/metrics
+```
+
+**Makefile shortcuts:** `make pipeline | test | api | dashboard | compose-up | compose-down | clean`
 
 **With AI (optional):**
 

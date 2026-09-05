@@ -8,6 +8,7 @@ venv/
 
 # Secrets / local env
 .env
+.env.local
 
 # Generated runtime data
 ledger_sentinel.db
@@ -20,3 +21,9 @@ audit_report.pdf
 /demo.gif
 .classify_cache.json
 .classify_cache.json.tmp
+
+# Docker packages (built locally, not committed)
+*.tar
+run-docker-package.sh
+ledger-sentinel.tar
+ledger-sentinel-compose.tar

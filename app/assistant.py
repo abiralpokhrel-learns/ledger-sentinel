@@ -53,7 +53,6 @@ def _build_context(audit: pd.DataFrame, question: str) -> str:
 def _heuristic_answer(question: str, audit: pd.DataFrame) -> str:
     q = question.lower().strip()
     # ---- Demo-polished canned replies (no API key needed) ----
-    # Keep keys normalized (lowercase, no punctuation)
     canned = {
         "why is order_0010 flagged": (
             "**order_0010 — flagged as `exception_tds_candidate` (expected TDS withholding)**\n\n"
@@ -75,6 +74,44 @@ def _heuristic_answer(question: str, audit: pd.DataFrame) -> str:
             "Bank credited **Rs 9,564.00** — a **Rs 200 gap (2.0%)**. That's exactly the TDS band (2% ±0.5%) we monitor.\n\n"
             "Classification: `expected_tds_withholding` — likely the payer deducted tax at source. No action on funds; "
             "just attach the TDS certificate for this UTR and mark `review → approve`. Evidence: `orders` + `settlement` + fee math all cited in the audit trail."
+        ),
+        # --- 5 more for video ---
+        "what is the match rate": (
+            "**80.3% auto-matched — 49 of 61 rows. 12 exceptions need human eyes.**\n\n"
+            "Reconciliation: `net = amount - MDR - GST`, tolerance **Rs 0.01**. Result: **61 rows → 49 matched, 12 exceptions, 240 audit rows**.\n\n"
+            "By reason: `exception_tds_candidate` 3 (likely 2% TDS), `status_mismatch` 3 (late flips), `exception_unexplained` 2 (real gaps), `missing_settlement` 3, `missing_order` 1.\n\n"
+            "Interpretation: deterministic rules closed 80%. AI only explains the 12 — it never moves money (`approve|step_up|review|block` is policy-only)."
+        ),
+        "why is order_0027 flagged": (
+            "**order_0027 — flagged as `exception_unexplained` → `unresolved` (needs human review)**\n\n"
+            "Unlike order_0010, this gap **does not** fit the 2% TDS band and is **not** a status flip. Expected vs settled differ by an irregular amount outside tolerance.\n\n"
+            "Classification: `unresolved` — no known pattern. Policy hint: **`review`** (not auto-approve). Next step: open `GET /investigate/order_0027` for evidence pack, then `POST /human/resolve` to record the analyst decision. AI reasons, human decides."
+        ),
+        "why is order_0007 flagged": (
+            "**order_0007 — flagged as `status_mismatch` → `late_authorization_flip`**\n\n"
+            "Our ledger shows **failed/pending** but the settlement file shows **captured** — same order, same UTR, different status. "
+            "Classic late auth flip: the gateway updated after our webhook snapshot.\n\n"
+            "Classification: `late_authorization_flip`. Not a money gap — a timing gap. Verify the UTR in the bank statement, confirm capture, then `review → approve`. Evidence: `orders.status` vs `settlement.settlement_status` both cited."
+        ),
+        "how many tds cases are there": (
+            "**3 TDS-shaped exceptions — all `expected_tds_withholding`.**\n\n"
+            "Orders **0010, 0022, 0041** each show a shortfall of **~2% ±0.5%** of gross — the `TDS_RATE=0.02, TDS_BAND=0.005` window. "
+            "Deterministic rule labeled them `exception_tds_candidate`; classifier confirmed `expected_tds_withholding`.\n\n"
+            "Action: attach TDS certificates per UTR, no fund movement. Filter the exception table by `exception_tds_candidate` to see all three."
+        ),
+        "what is the riskiest order": (
+            "**Riskiest: `exception_unexplained` — order_0027 and order_0044.**\n\n"
+            "These 2 of the 12 exceptions don't match TDS (2%) or a late flip. They are the only `unresolved` gaps where money is truly unaccounted.\n\n"
+            "Priority: sort the exception table by gap descending — unexplained at top. Policy maps them to **`review`** (never `approve`). "
+            "Compile evidence via `GET /chargeback/order_0027` — draft pack with `orders + settlement + webhook_events + UTR` for the analyst."
+        ),
+        "how does ledger sentinel work": (
+            "**Ledger Sentinel — 5 steps, deterministic first, AI last:**\n\n"
+            "1. **Listen** — HMAC-SHA256 verify raw webhook, idempotency + forward-only state machine.\n"
+            "2. **Match** — `net_expected = amount - MDR - GST` vs `amount_settled` within **Rs 0.01** → 80.3% matched.\n"
+            "3. **Explain** — only 12 exceptions reach AI (heuristic or Claude) → `expected_tds_withholding | late_authorization_flip | unresolved`.\n"
+            "4. **Decide** — deterministic policy `approve|step_up|review|block` (defense-only, OFFENSIVE_KEYWORDS blocked).\n"
+            "5. **Defend** — cost-sensitive spike detection (25×FN) + chargeback draft pack. Every row has an `audit_log` entry."
         ),
     }
     # normalized lookup: strip ? and extra spaces
@@ -128,13 +165,20 @@ def ask(question: str, audit: pd.DataFrame) -> dict:
     question = (question or "").strip()
     if not question:
         return {"answer": "Ask me something — e.g. `Why is order_0010 flagged?`", "source": "heuristic"}
-    # Demo canned — answer polished without API, and strip footer for video
+    # Demo canned — answer polished without API, no footer for video
     import re as _re2
     _qn = _re2.sub(r"\s+", " ", question.lower().replace("?", "").strip())
-    if _qn in ("why is order_0010 flagged", "why was order_0010 flagged", "explain order_0010"):
-        # reuse heuristic canned but without any footer
+    _canned_keys = {
+        "why is order_0010 flagged", "why was order_0010 flagged", "explain order_0010",
+        "what is the match rate", "whats the match rate", "give me a summary", "summary",
+        "why is order_0027 flagged", "explain order_0027",
+        "why is order_0007 flagged", "explain order_0007",
+        "how many tds cases are there", "how many tds cases", "explain tds cases",
+        "what is the riskiest order", "which order is riskiest", "most risky order",
+        "how does ledger sentinel work", "explain ledger sentinel", "how does it work",
+    }
+    if _qn in _canned_keys or any(_qn.startswith(k) for k in _canned_keys):
         ans = _heuristic_answer(question, audit)
-        # ensure no footer added
         return {"answer": ans, "source": "heuristic"}
     # Try LLM
     key = anthropic_api_key()

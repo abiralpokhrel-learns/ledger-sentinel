@@ -403,6 +403,9 @@ streamlit run dashboard/app.py   # → http://localhost:8501
 |--------|------|--------------|--------------|
 | `POST` | `/webhook` | Razorpay webhook (requires `x-razorpay-signature`) | HMAC raw bytes, idempotency, state machine |
 | `GET` | `/health` | Health check | — |
+| `GET` | `/healthz` | Liveness (no DB) | K8s probe |
+| `GET` | `/readyz` | Readiness (checks DB) | K8s probe, 503 when not ready |
+| `GET` | `/metrics` | Prometheus metrics | `ledger_sentinel_matched` etc. |
 | `GET` | `/stats` | KPI summary | Reuses `app.state.db` |
 | `POST` | `/ask` | AI Finance Assistant (`{"question":"..."}`) | `source: heuristic` vs `claude` labeled |
 | `GET` | `/export.csv?outcome=exception` | Download audit CSV | Filtered |
@@ -494,6 +497,9 @@ All via environment (see `.env.example`). Dev defaults allow `generate_synthetic
 | `LEDGER_DB_PATH` | `ledger_sentinel.db` | SQLite path (WAL) |
 | `LEDGER_TOLERANCE` | `0.01` | Matching tolerance (Rs) |
 | `LEDGER_STRICT` | — | `1` refuses dev default `WEBHOOK_SECRET` |
+| `LEDGER_JSON_LOGS` | `0` | `1` enables JSON structured logs |
+| `LEDGER_RATE_LIMIT_PER_MIN` | `120` | Rate limit on webhook/analyst/detect |
+| `LEDGER_CORS_ORIGINS` | `*` | CORS allowlist |
 | `LEDGER_NO_CACHE` | — | `1` disables classification cache |
 | `LEDGER_USE_MCP` | `auto` | `auto|force|off` for live settlement fetch |
 | `LEDGER_MCP_MODE` | `remote` | `remote` (npx) or `local` (docker) |
@@ -526,8 +532,10 @@ If any offense-capable code were added, `decide()` and `compile_response()` woul
 ## Testing & Verification
 
 ```bash
-# All tests (30: 8 reconcile + 12 webhook + 10 defense)
-PYTHONPATH=. pytest tests/ -q
+# All tests (43: 8 reconcile + 12 webhook + 10 defense + 5 batched/investigator + 8 investor/analyst)
+PYTHONPATH=. pytest tests/ -q   # or: pytest (pytest.ini sets pythonpath)
+# or via Makefile:
+make test
 
 # Checks
 python scripts/live_webhook_check.py        # real HTTP webhook gates
@@ -552,7 +560,7 @@ CI runs on every push (`PYTHONPATH=. pytest` → `generate_synthetic_data.py` �
 ```
 ledger-sentinel/
 ├── app/
-│   ├── main.py              # FastAPI app + pipeline + all APIs
+│   ├── main.py              # FastAPI app + pipeline + all APIs + prod middleware
 │   ├── webhook.py           # HMAC, idempotency, state machine
 │   ├── reconcile.py         # tolerance matching, status consistency
 │   ├── classify.py          # AI classification + heuristic + batch+cache
@@ -573,24 +581,28 @@ ledger-sentinel/
 ├── dashboard/
 │   └── app.py               # Pro dashboard + defense panel
 ├── data/
-│   ├── demo_story_orders.csv # 10-order beautiful demo
+│   ├── demo_story_orders.csv # 12-order beautiful demo (10 + 2 batched recovery)
 │   ├── demo_story_settlement.csv
 │   └── generate_synthetic_data.py  # 60 orders, 179 events, 59 settlements + planted edges
 ├── tests/
 │   ├── test_reconcile.py    # 8
 │   ├── test_webhook.py      # 12
 │   ├── test_defense.py      # 10 — cost, policy, chargeback, honest metrics
-│   ├── test_batched.py      # 4 — batched UTR, demo story
+│   ├── test_batched.py      # 5 — batched UTR, demo story
 │   └── test_investigator.py # 8 — investigator, clustering, analyst, learning
 ├── docs/
 │   ├── dev-log.md           # real 0% match bug, root cause, audit-log proof
+│   ├── production.md        # Docker + k8s probes + metrics + security
 │   ├── demo.gif             # demo walkthrough (see Architecture)
 ├── scripts/
 │   ├── dashboard_smoke_check.py
 │   ├── live_webhook_check.py
 │   ├── generate_architecture.py
 │   └── generate_demo_gif.py   # builds docs/demo.gif
-├── .github/workflows/ci.yml # PYTHONPATH=. + pytest + pipeline
+├── Dockerfile               # python:3.11-slim + healthcheck
+├── docker-compose.yml       # api :8000 + dashboard :8501 + ledger_data volume
+├── Makefile                 # pipeline/test/api/dashboard/docker/compose shortcuts
+├── .github/workflows/ci.yml # ruff + py_compile + docker build + pytest
 └── ledger_sentinel.db       # WAL, gitignored runtime artifact
 ```
 

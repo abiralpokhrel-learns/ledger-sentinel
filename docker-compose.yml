@@ -24,6 +24,7 @@ services:
     env_file: .env
     environment:
       LEDGER_DB_PATH: /data/ledger_sentinel.db
+      PYTHONPATH: .
     volumes:
       - ledger_data:/data
     depends_on:

@@ -159,11 +159,14 @@ def classify_exception(row: dict) -> dict:
             _cache_set(cache_key, result)
         return result
     except Exception as exc:  # never let the AI block the pipeline
-        # Log once, fallback deterministically
+        # Log once, fallback deterministically — strip auth details
         fallback = _heuristic_classify(row)
-        # Don't leak full exception to audit_note if it contains secrets
-        short_exc = str(exc)[:120].replace("\n", " ")
-        fallback["audit_note"] = f"[AI call failed: {short_exc}] {fallback['audit_note']}"
+        msg = str(exc).lower()
+        if "401" in msg or "authentication" in msg or "invalid" in msg or "api key" in msg:
+            # auth failure — don't pollute audit_note with it
+            return fallback
+        short_exc = str(exc)[:80].replace("\n", " ")
+        fallback["audit_note"] = f"[AI unavailable] {fallback['audit_note']}"
         return fallback
 
 

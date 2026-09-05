@@ -112,7 +112,12 @@ def ask(question: str, audit: pd.DataFrame) -> dict:
                 if text.strip():
                     return {"answer": text.strip(), "source": "claude"}
             except Exception as e:
-                # fall through to heuristic with note
+                # Never leak raw API key / 401 details — fall back to heuristic silently
+                msg = str(e)
+                # Common: invalid x-api-key / authentication_error — treat as missing key
+                if "401" in msg or "authentication" in msg.lower() or "invalid" in msg.lower():
+                    h = _heuristic_answer(question, audit)
+                    return {"answer": h + "\n\n*(AI key not configured — heuristic answer. Set ANTHROPIC_API_KEY in .env for Claude.)*", "source": "heuristic"}
                 h = _heuristic_answer(question, audit)
-                return {"answer": f"[AI temporarily unavailable: {str(e)[:100]}]\n\n{h}", "source": "heuristic"}
+                return {"answer": h + f"\n\n*(AI temporarily unavailable — heuristic fallback.)*", "source": "heuristic"}
     return {"answer": _heuristic_answer(question, audit), "source": "heuristic"}
